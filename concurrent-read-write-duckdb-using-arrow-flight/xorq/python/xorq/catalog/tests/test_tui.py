@@ -1,0 +1,3105 @@
+"""Tests for the catalog TUI using Textual's Pilot test driver.
+
+Strategy:
+- Format helpers and frozen data classes: pure unit tests, no catalog needed.
+- Screen composition, navigation, rendering: use a real Catalog backed by a
+  temporary git repo so that CatalogEntry objects carry genuine expr_metadata,
+  backends, and column info loaded from the zip archive.
+- Git log: use the real repo that backs the catalog fixture.
+
+IMPORTANT — populating the catalog tree in pilot tests:
+    Never wait for the async _do_refresh worker to populate rows.  It runs in
+    a background thread on a timer and is inherently racy under test.  Instead,
+    build CatalogRowData objects and call _render_refresh() directly — see the
+    _populate_tree() helper below.
+"""
+
+import asyncio
+import importlib
+import re
+from pathlib import Path
+from unittest.mock import patch
+
+import pytest
+from textual.containers import VerticalScroll
+from textual.pilot import Pilot
+from textual.widgets import DataTable, Input, Select, Static, Tree
+
+import xorq.api as xo
+import xorq.config
+from xorq.caching import ParquetSnapshotCache
+from xorq.catalog.bind import _eval_code
+from xorq.catalog.catalog import Catalog, CatalogAlias, CatalogEntry
+from xorq.catalog.exceptions import CatalogPushError
+from xorq.catalog.tests.testing import (
+    Assert,
+    Press,
+    WaitUntil,
+    run_script,
+    settle,
+    wait_until,
+)
+from xorq.catalog.tui import (
+    BOUNDARY_STYLES,
+    EXPANDABLE_MARKER,
+    EXPANDED_MARKER,
+    GIT_LOG_COLUMNS,
+    KIND_ORDER,
+    KIND_STYLES,
+    LINEAGE_TREE_OFFSET,
+    NO_MARKER,
+    UNKNOWN_BOUNDARY_STYLE,
+    AddAliasScreen,
+    AddEntryScreen,
+    CatalogRowData,
+    CatalogScreen,
+    CatalogTUI,
+    DataViewScreen,
+    DeleteEntryScreen,
+    ExprStack,
+    ExprStep,
+    GitLogRowData,
+    RemoveAliasScreen,
+    RevisionRowData,
+    _build_git_log_rows,
+    _dag_label,
+    _entry_info,
+    _find_project_path,
+    _format_cached,
+    _get_catalog_aliases,
+    _list_revisions_cached,
+    _pygments_to_text,
+    _pygments_tokens,
+    _render_lineage_rows,
+    _render_sql_dag,
+    _render_sql_text,
+    _styled_branch_label,
+    get_cache_key_path,
+)
+from xorq.catalog.zip_utils import extract_build_zip_to
+from xorq.common.utils.defer_utils import deferred_read_parquet
+from xorq.common.utils.env_utils import (
+    EnvConfigable,
+    env_templates_dir,
+)
+from xorq.common.utils.lineage_utils import (
+    COLUMN_KIND,
+    LineageDAG,
+    LineageRow,
+    compact_lineage_rows,
+)
+from xorq.config import TUI, options
+from xorq.ibis_yaml.enums import ExprKind
+
+
+def _run(coro):
+    """Run an async coroutine in a fresh event loop (avoids pytest-asyncio)."""
+    return asyncio.run(coro)
+
+
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def entry_a(catalog):
+    """A three-column bound expression: id (int), name (str), score (float)."""
+    expr = xo.memtable({"id": [1, 2], "name": ["alice", "bob"], "score": [9.5, 8.1]})
+    return catalog.add(expr)
+
+
+@pytest.fixture
+def entry_b(catalog):
+    """A single-column bound expression: value (int)."""
+    expr = xo.memtable({"value": [10, 20, 30]})
+    return catalog.add(expr)
+
+
+@pytest.fixture
+def entry_columns(catalog: Catalog) -> CatalogEntry:
+    """An expression whose root node stores a schema worth expanding."""
+    t = xo.memtable({"a": [1, 2, 3], "b": ["x", "y", "z"]})
+    expr = t.filter(t.a > 1).mutate(c=t.a * 2).group_by("b").agg(n=xo._.a.sum())
+    return catalog.add(expr)
+
+
+@pytest.fixture
+def entry_wide(catalog: Catalog) -> CatalogEntry:
+    """Enough columns that one expansion overflows a short panel."""
+    t = xo.memtable({f"c{i}": [1, 2] for i in range(24)})
+    return catalog.add(t.filter(t.c0 > 0))
+
+
+@pytest.fixture
+def entry_cached(catalog, tmp_path):
+    """A memtable expression wrapped with ParquetSnapshotCache."""
+    cache = ParquetSnapshotCache.from_kwargs(relative_path=tmp_path / "cache")
+    expr = xo.memtable({"x": [1, 2, 3], "y": [4, 5, 6]}).cache(cache=cache)
+    return catalog.add(expr)
+
+
+@pytest.fixture
+def entry_udxf(catalog: Catalog) -> CatalogEntry:
+    """A FlightUDXF over an into_backend'd memtable: the UDXF appends one column.
+
+    Construction and build only -- no Flight server is started.
+    """
+    con = xo.connect()
+    inner = xo.memtable({"a": [1, 2, 3]}, name="t_udxf").into_backend(con, "inner")
+    expr = xo.expr.relations.flight_udxf(
+        inner,
+        process_df=lambda df: df.assign(b=1),
+        maybe_schema_in=inner.schema(),
+        maybe_schema_out=xo.schema(inner.schema() | {"b": "int64"}),
+        con=con,
+        make_udxf_kwargs={"name": "AddB"},
+    )
+    return catalog.add(expr)
+
+
+@pytest.fixture
+def alias_for_a(catalog, entry_a):
+    """Add alias 'my-model' to entry_a and return the alias string."""
+    alias = "my-model"
+    catalog.add_alias(entry_a.name, alias)
+    return alias
+
+
+def _make_tui(catalog):
+    return CatalogTUI(lambda: catalog)
+
+
+async def _populate_tree(pilot, catalog, *entries):
+    """Deterministically populate the catalog tree with the given entries.
+
+    Use this instead of waiting for the async _do_refresh worker, which is
+    racy under test.  Returns the CatalogScreen and the list of CatalogRowData.
+    """
+    await settle(pilot)
+    screen = pilot.app.screen
+    rows = tuple(CatalogRowData(entry=e) for e in entries)
+    screen._row_cache = {r.row_key: r for r in rows}
+    screen._render_refresh(catalog.repo.working_dir, rows)
+    await settle(pilot)
+    return screen, rows
+
+
+# ---------------------------------------------------------------------------
+# 1. Pure unit tests: format helpers
+# ---------------------------------------------------------------------------
+
+
+def test_format_cached_true():
+    assert _format_cached(True) == "●"
+
+
+def test_format_cached_false():
+    assert _format_cached(False) == "○"
+
+
+def test_format_cached_none():
+    assert _format_cached(None) == "—"
+
+
+def test_revision_row_columns_display_none():
+    assert RevisionRowData(column_count=None).columns_display == "?"
+
+
+def test_revision_row_columns_display_int():
+    assert RevisionRowData(column_count=5).columns_display == "5 cols"
+
+
+def test_revision_row_columns_display_zero():
+    assert RevisionRowData(column_count=0).columns_display == "0 cols"
+
+
+@pytest.mark.parametrize("kind", list(ExprKind))
+def test_kind_order_and_styles_cover_every_expr_kind(kind):
+    """KIND_ORDER and KIND_STYLES must include every ExprKind value.
+
+    Drift here causes branch ordering to drop the kind and
+    _styled_branch_label to KeyError at render time.
+    """
+    assert kind in KIND_ORDER
+    assert kind in KIND_STYLES
+
+
+@pytest.mark.parametrize("kind", list(ExprKind))
+def test_styled_branch_label_renders_every_kind(kind):
+    label = _styled_branch_label(kind, 1)
+    assert kind in label.plain
+    assert "(1)" in label.plain
+
+
+# ---------------------------------------------------------------------------
+# 2. Unit tests: frozen data classes backed by real catalog entries
+# ---------------------------------------------------------------------------
+
+
+def test_cached_is_none_for_plain_memtable(entry_a):
+    row = CatalogRowData(entry=entry_a)
+    assert not row.cached
+
+
+def test_schema_out_single_column(entry_b):
+    row = CatalogRowData(entry=entry_b)
+    assert len(row.schema_out) == 1
+
+
+def test_row_key_is_entry_name(entry_a, entry_b):
+    row_a = CatalogRowData(entry=entry_a)
+    row_b = CatalogRowData(entry=entry_b)
+    assert row_a.row_key == entry_a.name
+    assert row_b.row_key == entry_b.name
+    assert row_a.row_key != row_b.row_key
+
+
+def test_cached_with_parquet_snapshot(entry_cached):
+    row = CatalogRowData(entry=entry_cached)
+    assert row.cached is False
+    assert row.cached_display == "○"
+
+    entry_cached.expr.execute()
+
+    row_after = CatalogRowData(entry=entry_cached)
+    assert row_after.cached is True
+    assert row_after.cached_display == "●"
+
+
+def test_catalog_row_data_is_frozen(entry_a):
+    row = CatalogRowData(entry=entry_a)
+    with pytest.raises(AttributeError):
+        row.aliases = ("new-name",)
+
+
+def test_lineage_text_renders_compact_boundary_tree(entry_a):
+    """lineage_text is the compact boundary view, not a flat arrow chain."""
+    row = CatalogRowData(entry=entry_a)
+    lines = row.lineage_text.splitlines()
+
+    assert "→" not in lines[0], "root should not be a flattened arrow chain"
+    assert any("InMemoryTable" in line for line in lines), row.lineage_text
+
+
+def test_lineage_text_shows_cache_boundary(entry_cached: CatalogEntry) -> None:
+    row = CatalogRowData(entry=entry_cached)
+    assert "Cache[" in row.lineage_text, row.lineage_text
+
+
+def test_lineage_rich_styles_each_boundary_kind(entry_udxf: CatalogEntry) -> None:
+    """Boundary kinds get an icon and a colour; the tree glyphs and the collapsed
+    `via` runs stay dim.  `lineage_text` is the same render's plain text."""
+    row = CatalogRowData(entry=entry_udxf)
+    rich = row.lineage_rich
+
+    assert row.lineage_text == rich.plain
+    assert BOUNDARY_STYLES["flight_udxf"].icon in rich.plain
+    assert BOUNDARY_STYLES["table"].icon in rich.plain
+
+    styles = {str(span.style) for span in rich.spans}
+    assert any(BOUNDARY_STYLES["flight_udxf"].color in s for s in styles), styles
+    assert any("dim" in s for s in styles), styles
+
+    # a kind we did not style would render with the unknown-boundary icon
+    assert UNKNOWN_BOUNDARY_STYLE.icon not in rich.plain
+
+
+def test_lineage_panel_rich_puts_cache_and_hash_above_the_tree(
+    entry_udxf: CatalogEntry,
+) -> None:
+    row = CatalogRowData(entry=entry_udxf)
+    lines = row.lineage_panel_rich().plain.splitlines()
+
+    assert lines[0].startswith("Cache: ")
+    assert lines[1].startswith("Hash: ")
+    assert lines[2] == ""
+    # The tree renders with no header and no indent beyond the fold gutter: the
+    # panel's border title labels it.
+    tree_lines = lines[LINEAGE_TREE_OFFSET:]
+    assert tree_lines == row.lineage_rich.plain.splitlines()
+    # every row opens with the two-column fold gutter, so the labels line up
+    assert all(
+        line[:2] in (NO_MARKER, EXPANDABLE_MARKER, EXPANDED_MARKER)
+        or line[:2].strip("│├└─ ") == ""
+        for line in tree_lines
+    )
+    assert tree_lines[0][:2] == EXPANDABLE_MARKER, "the root stores a schema"
+    assert row.lineage_panel_text() == row.lineage_panel_rich().plain
+
+
+def test_lineage_rich_of_a_legacy_sidecar_uses_the_unknown_style() -> None:
+    """A pre-boundary sidecar annotates nothing, so every row falls back to the
+    unknown-boundary style instead of raising or missing a style lookup."""
+    legacy = LineageDAG.from_dict(
+        {
+            "nodes": [
+                {"id": "0", "type": "Filter", "label": "Filter"},
+                {"id": "1", "type": "InMemoryTable", "label": "InMemoryTable"},
+            ],
+            "edges": [["0", "1"]],
+            "root": "0",
+        }
+    )
+
+    rendered = _render_lineage_rows(compact_lineage_rows(legacy))
+
+    # nothing is folded here, so the fold gutter is blank
+    assert rendered.plain == f"{NO_MARKER}{UNKNOWN_BOUNDARY_STYLE.icon} Filter"
+    assert any(UNKNOWN_BOUNDARY_STYLE.color in str(s.style) for s in rendered.spans)
+
+
+def test_lineage_text_renders_udxf_identity_and_nested_input(
+    entry_udxf: CatalogEntry,
+) -> None:
+    """A FlightUDXF is the one boundary where the schema really changes: the TUI
+    must show the UDXF identity, the transition, and the nested input source."""
+    text = CatalogRowData(entry=entry_udxf).lineage_text
+    lines = text.splitlines()
+
+    assert "UDXF[AddB] : 1→2 cols" in text, text
+    assert "(+b)" in text, text
+    # the input lineage of the UDXF hangs underneath it, not in the outer chain
+    udxf_line = next(i for i, line in enumerate(lines) if "UDXF[" in line)
+    nested = lines[udxf_line + 1 :]
+    assert any("↳" in line for line in nested), text
+    assert any("t_udxf" in line or "InMemoryTable" in line for line in nested), text
+
+
+def test_revision_row_data_current():
+    row = RevisionRowData(
+        hash="abc123",
+        column_count=3,
+        cached=True,
+        commit_date="2025-01-01",
+        is_current=True,
+    )
+    assert row.status_display == "CURRENT →"
+    assert row.row[0] == "CURRENT →"
+
+
+def test_revision_row_data_not_current():
+    row = RevisionRowData(hash="def456", is_current=False)
+    assert row.status_display == ""
+
+
+# ---------------------------------------------------------------------------
+# 3. Pilot tests: app setup
+# ---------------------------------------------------------------------------
+
+
+def test_app_starts_and_pushes_catalog_screen(catalog):
+    async def _test():
+        app = _make_tui(catalog)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await settle(pilot)
+            assert isinstance(app.screen, CatalogScreen)
+
+    _run(_test())
+
+
+def test_app_has_custom_theme(catalog):
+    async def _test():
+        app = _make_tui(catalog)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await settle(pilot)
+            assert app.theme == "xorq-dark"
+
+    _run(_test())
+
+
+def test_catalog_tree_exists(catalog):
+    async def _test():
+        app = _make_tui(catalog)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await settle(pilot)
+            tree = app.screen.query_one("#catalog-tree", Tree)
+            assert tree is not None
+            assert tree.show_root is False
+
+    _run(_test())
+
+
+def test_status_bar_exists(catalog):
+    async def _test():
+        app = _make_tui(catalog)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await settle(pilot)
+            status = app.screen.query_one("#status-bar", Static)
+            assert status is not None
+
+    _run(_test())
+
+
+def test_panel_border_titles(catalog):
+    async def _test():
+        app = _make_tui(catalog)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await settle(pilot)
+            catalog_panel = app.screen.query_one("#catalog-panel")
+            assert "Expressions" in str(catalog_panel.border_title)
+
+            schema_panel = app.screen.query_one("#schema-panel")
+            assert schema_panel.border_title == "Schema"
+
+    _run(_test())
+
+
+def test_quit_exits_app(catalog):
+    async def _test():
+        app = _make_tui(catalog)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await settle(pilot)
+            await pilot.press("q")
+
+    _run(_test())
+
+
+def test_add_entry_from_build_directory_with_alias(catalog, entry_a, entry_b, tmp_path):
+    async def _test():
+        zip_path = catalog.get_zip(entry_b.name, dir_path=tmp_path)
+        extract_dir = tmp_path / "extracted"
+        extract_dir.mkdir()
+        build_dir = extract_build_zip_to(zip_path, extract_dir)
+        catalog.remove(entry_b.name)
+        app = _make_tui(catalog)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _populate_tree(pilot, catalog, entry_a)
+            await pilot.press("a")
+            await settle(pilot)
+
+            assert isinstance(app.screen, AddEntryScreen)
+            app.screen.query_one("#add-entry-path", Input).value = str(build_dir)
+            app.screen.query_one("#add-entry-alias", Input).value = "restored"
+            await pilot.press("ctrl+r")
+            await wait_until(pilot, lambda: entry_b.name in catalog.list())
+
+            assert isinstance(app.screen, CatalogScreen)
+            assert "restored" in catalog.list_aliases()
+            assert entry_b.name in app.screen._tree_entry_hashes()
+            assert app.screen._row_cache[entry_b.name].aliases == ("restored",)
+
+    _run(_test())
+
+
+def test_add_entry_rejects_zip_path(catalog, tmp_path):
+    async def _test():
+        zip_path = tmp_path / "build.zip"
+        zip_path.touch()
+        app = _make_tui(catalog)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await settle(pilot)
+            await pilot.press("a")
+            await settle(pilot)
+
+            assert isinstance(app.screen, AddEntryScreen)
+            app.screen.query_one("#add-entry-path", Input).value = str(zip_path)
+            await pilot.press("ctrl+r")
+            await settle(pilot)
+
+            assert isinstance(app.screen, AddEntryScreen)
+            assert catalog.list() == []
+
+    _run(_test())
+
+
+def test_add_alias_to_selected_entry(catalog, entry_a):
+    async def _test():
+        app = _make_tui(catalog)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _populate_tree(pilot, catalog, entry_a)
+            await pilot.press("j", "A")
+            await settle(pilot)
+
+            assert isinstance(app.screen, AddAliasScreen)
+            app.screen.query_one("#add-alias-name", Input).value = "new-alias"
+            await pilot.press("ctrl+r")
+            await wait_until(pilot, lambda: "new-alias" in catalog.list_aliases())
+
+            assert isinstance(app.screen, CatalogScreen)
+            assert entry_a.name in catalog.list()
+            assert app.screen._row_cache[entry_a.name].aliases == ("new-alias",)
+            assert "new-alias" in _leaf_label_for(app.screen, entry_a.name)
+
+    _run(_test())
+
+
+def test_add_alias_binding_only_visible_on_focused_entry(catalog, entry_a):
+    async def _test():
+        app = _make_tui(catalog)
+        async with app.run_test(size=(120, 40)) as pilot:
+            screen, _ = await _populate_tree(pilot, catalog, entry_a)
+
+            # The cursor starts on the kind branch, so Add Alias is hidden.
+            assert "A" not in app.active_bindings
+
+            await pilot.press("j")
+            await settle(pilot)
+            assert screen._selected_row_data() is not None
+            assert "A" in app.active_bindings
+
+            # Moving focus away from the entries panel hides the action again.
+            await pilot.press("tab")
+            await settle(pilot)
+            assert "A" not in app.active_bindings
+
+    _run(_test())
+
+
+def test_delete_entry_can_be_cancelled(catalog, entry_a):
+    async def _test():
+        app = _make_tui(catalog)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _populate_tree(pilot, catalog, entry_a)
+            await pilot.press("j", "d")
+            await settle(pilot)
+
+            assert isinstance(app.screen, DeleteEntryScreen)
+            await pilot.press("escape")
+            await settle(pilot)
+
+            assert isinstance(app.screen, CatalogScreen)
+            assert entry_a.name in catalog.list()
+
+    _run(_test())
+
+
+def test_delete_entry_removes_entry_and_aliases(catalog, entry_a):
+    async def _test():
+        catalog.add_alias(entry_a.name, "to-delete")
+        app = _make_tui(catalog)
+        row = CatalogRowData(entry=entry_a, aliases=("to-delete",))
+        async with app.run_test(size=(120, 40)) as pilot:
+            await settle(pilot)
+            screen = app.screen
+            screen._row_cache = {row.row_key: row}
+            screen._render_refresh(catalog.repo.working_dir, (row,))
+            await settle(pilot)
+
+            await pilot.press("j", "d")
+            await settle(pilot)
+            assert isinstance(app.screen, DeleteEntryScreen)
+
+            await pilot.press("ctrl+r")
+            await wait_until(pilot, lambda: entry_a.name not in catalog.list())
+
+            assert isinstance(app.screen, CatalogScreen)
+            assert "to-delete" not in catalog.list_aliases()
+            assert entry_a.name not in app.screen._tree_entry_hashes()
+
+    _run(_test())
+
+
+def test_remove_alias_keeps_entry_and_other_aliases(catalog, entry_a):
+    async def _test():
+        catalog.add_alias(entry_a.name, "keep-me")
+        catalog.add_alias(entry_a.name, "remove-me")
+        app = _make_tui(catalog)
+        row = CatalogRowData(entry=entry_a, aliases=("keep-me", "remove-me"))
+        async with app.run_test(size=(120, 40)) as pilot:
+            await settle(pilot)
+            screen = app.screen
+            screen._row_cache = {row.row_key: row}
+            screen._render_refresh(catalog.repo.working_dir, (row,))
+            await settle(pilot)
+
+            await pilot.press("j", "r")
+            await settle(pilot)
+            assert isinstance(app.screen, RemoveAliasScreen)
+
+            select = app.screen.query_one("#remove-alias-select", Select)
+            select.value = "remove-me"
+            await pilot.press("ctrl+r")
+            await wait_until(pilot, lambda: "remove-me" not in catalog.list_aliases())
+
+            assert isinstance(app.screen, CatalogScreen)
+            assert entry_a.name in catalog.list()
+            assert "keep-me" in catalog.list_aliases()
+            assert app.screen._row_cache[entry_a.name].aliases == ("keep-me",)
+
+    _run(_test())
+
+
+@pytest.mark.parametrize(
+    "key",
+    [pytest.param("d", id="delete"), pytest.param("r", id="remove-alias")],
+)
+def test_destructive_binding_only_visible_on_focused_entry(
+    catalog: Catalog, entry_a: CatalogEntry, key: str
+) -> None:
+    """delete (d) and remove-alias (r) must be gated on the entries tree being
+    focused with a leaf selected -- otherwise the key bubbles up from another
+    panel and acts on a stale tree cursor (mirrors the add-alias guard)."""
+
+    async def _test():
+        app = _make_tui(catalog)
+        async with app.run_test(size=(120, 40)) as pilot:
+            screen, _ = await _populate_tree(pilot, catalog, entry_a)
+
+            # Cursor starts on the kind branch (no leaf selected) -> hidden.
+            assert key not in app.active_bindings
+
+            await pilot.press("j")
+            await settle(pilot)
+            assert screen._selected_row_data() is not None
+            assert key in app.active_bindings
+
+            # Moving focus off the entries panel hides the action again.
+            await pilot.press("tab")
+            await settle(pilot)
+            assert key not in app.active_bindings
+
+    _run(_test())
+
+
+def test_find_project_path_walks_up_from_build_dir(tmp_path: Path) -> None:
+    project = tmp_path / "proj"
+    build_dir = project / "builds" / "abc123"
+    build_dir.mkdir(parents=True)
+    (project / "pyproject.toml").touch()
+    assert _find_project_path(build_dir) == project
+
+
+def test_find_project_path_returns_none_when_absent(tmp_path: Path) -> None:
+    build_dir = tmp_path / "orphan"
+    build_dir.mkdir()
+    assert _find_project_path(build_dir) is None
+
+
+def test_add_entry_forwards_project_path_anchored_on_build_dir(
+    catalog: Catalog,
+    entry_a: CatalogEntry,
+    entry_b: CatalogEntry,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The TUI add path must anchor project_path on the build directory, not
+    the process cwd, so an unpackaged build adds even when the TUI was launched
+    from outside the project tree."""
+
+    async def _test():
+        zip_path = catalog.get_zip(entry_b.name, dir_path=tmp_path)
+        project = tmp_path / "proj"
+        (project / "pyproject.toml").parent.mkdir(parents=True, exist_ok=True)
+        (project / "pyproject.toml").touch()
+        extract_dir = project / "builds"
+        extract_dir.mkdir()
+        build_dir = extract_build_zip_to(zip_path, extract_dir)
+        catalog.remove(entry_b.name)
+
+        captured = {}
+        real_add = Catalog.add
+
+        def spy_add(self, obj, *args, **kwargs):
+            captured["project_path"] = kwargs.get("project_path")
+            return real_add(self, obj, *args, **kwargs)
+
+        monkeypatch.setattr(Catalog, "add", spy_add)
+
+        app = _make_tui(catalog)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _populate_tree(pilot, catalog, entry_a)
+            await pilot.press("a")
+            await settle(pilot)
+
+            assert isinstance(app.screen, AddEntryScreen)
+            app.screen.query_one("#add-entry-path", Input).value = str(build_dir)
+            await pilot.press("ctrl+r")
+            await wait_until(pilot, lambda: entry_b.name in catalog.list())
+
+            assert captured["project_path"] == project
+
+    _run(_test())
+
+
+def test_delete_push_failure_warns_and_keeps_local_change(
+    catalog: Catalog, entry_a: CatalogEntry, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A post-commit remote push failure leaves the local change applied; the
+    TUI must re-render as applied and surface a warning about the divergence,
+    not an error that reads as 'nothing happened'."""
+
+    async def _test():
+        real_remove = Catalog.remove
+
+        def remove_local_then_push_fails(self, name, sync=True):
+            real_remove(self, name, sync=False)  # local commit lands, no push
+            raise CatalogPushError("push failed: simulated remote rejection")
+
+        monkeypatch.setattr(Catalog, "remove", remove_local_then_push_fails)
+
+        app = _make_tui(catalog)
+        notifications = []
+
+        async with app.run_test(size=(120, 40)) as pilot:
+            monkeypatch.setattr(
+                app,
+                "notify",
+                lambda message, **kwargs: notifications.append((message, kwargs)),
+            )
+            screen, _ = await _populate_tree(pilot, catalog, entry_a)
+
+            await pilot.press("j", "d")
+            await settle(pilot)
+            assert isinstance(app.screen, DeleteEntryScreen)
+
+            await pilot.press("ctrl+r")
+            await wait_until(pilot, lambda: entry_a.name not in catalog.list())
+            await settle(pilot)
+
+            # Applied locally and re-rendered as such.
+            assert entry_a.name not in catalog.list()
+            assert entry_a.name not in app.screen._tree_entry_hashes()
+
+            # Warned (not errored) about the divergence.
+            message, kwargs = notifications[-1]
+            assert kwargs["severity"] == "warning"
+            assert "applied locally but remote push failed" in message
+
+    _run(_test())
+
+
+@pytest.mark.parametrize(
+    ("exc", "severity", "fragment"),
+    [
+        pytest.param(
+            CatalogPushError("push failed: simulated"),
+            "warning",
+            "applied locally but remote push failed",
+            id="push-error",
+        ),
+        pytest.param(ValueError("boom"), "error", "failed:", id="generic-error"),
+    ],
+)
+def test_run_locked_mutation_classifies_push_vs_generic_errors(
+    catalog: Catalog,
+    entry_a: CatalogEntry,
+    monkeypatch: pytest.MonkeyPatch,
+    exc: Exception,
+    severity: str,
+    fragment: str,
+) -> None:
+    """The shared mutation helper -- used by all four modal actions (add
+    entry/alias, delete, remove alias) -- warns on a post-commit push failure
+    but errors on any other exception.  Exercised here once directly rather
+    than through each of the four flows, which share this code path."""
+
+    async def _test():
+        app = _make_tui(catalog)
+        notifications = []
+        async with app.run_test(size=(120, 40)) as pilot:
+            monkeypatch.setattr(
+                app,
+                "notify",
+                lambda message, **kwargs: notifications.append((message, kwargs)),
+            )
+            screen, _ = await _populate_tree(pilot, catalog, entry_a)
+
+            def mutate(_catalog):
+                raise exc
+
+            # call_from_thread must run off the main thread, as the worker does.
+            await asyncio.to_thread(
+                screen._run_locked_mutation,
+                mutate,
+                log_event="test_event",
+                log_kwargs={},
+                title="Test",
+                verb="Do",
+                success=lambda result: "ok",
+            )
+            await settle(pilot)
+
+            message, kwargs = notifications[-1]
+            assert kwargs["severity"] == severity
+            assert fragment in message
+
+    _run(_test())
+
+
+def test_add_entry_can_be_cancelled(catalog: Catalog) -> None:
+    async def _test():
+        app = _make_tui(catalog)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await settle(pilot)
+            await pilot.press("a")
+            await settle(pilot)
+            assert isinstance(app.screen, AddEntryScreen)
+
+            await pilot.press("escape")
+            await settle(pilot)
+            assert isinstance(app.screen, CatalogScreen)
+            assert catalog.list() == []
+
+    _run(_test())
+
+
+def test_add_alias_can_be_cancelled(catalog: Catalog, entry_a: CatalogEntry) -> None:
+    async def _test():
+        app = _make_tui(catalog)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _populate_tree(pilot, catalog, entry_a)
+            await pilot.press("j", "A")
+            await settle(pilot)
+            assert isinstance(app.screen, AddAliasScreen)
+
+            await pilot.press("escape")
+            await settle(pilot)
+            assert isinstance(app.screen, CatalogScreen)
+            assert catalog.list_aliases() == []
+
+    _run(_test())
+
+
+def test_remove_alias_can_be_cancelled(catalog: Catalog, entry_a: CatalogEntry) -> None:
+    async def _test():
+        catalog.add_alias(entry_a.name, "keep-me")
+        app = _make_tui(catalog)
+        row = CatalogRowData(entry=entry_a, aliases=("keep-me",))
+        async with app.run_test(size=(120, 40)) as pilot:
+            await settle(pilot)
+            screen = app.screen
+            screen._row_cache = {row.row_key: row}
+            screen._render_refresh(catalog.repo.working_dir, (row,))
+            await settle(pilot)
+
+            await pilot.press("j", "r")
+            await settle(pilot)
+            assert isinstance(app.screen, RemoveAliasScreen)
+
+            await pilot.press("escape")
+            await settle(pilot)
+            assert isinstance(app.screen, CatalogScreen)
+            assert "keep-me" in catalog.list_aliases()
+
+    _run(_test())
+
+
+def test_j_k_moves_cursor(
+    catalog: Catalog, entry_a: CatalogEntry, entry_b: CatalogEntry
+) -> None:
+    async def _test():
+        app = _make_tui(catalog)
+        async with app.run_test(size=(120, 40)) as pilot:
+            screen, _ = await _populate_tree(pilot, catalog, entry_a, entry_b)
+            tree = screen.query_one("#catalog-tree", Tree)
+
+            # Tree structure: source (2) > entry_a, entry_b
+            # Initial cursor on "source" branch (data=kind string)
+            await run_script(
+                pilot,
+                Assert(lambda p: tree.cursor_node is not None),
+                Assert(lambda p: tree.cursor_node.data == "source"),  # on branch
+                Press(("j",)),
+                Assert(lambda p: tree.cursor_node.data == entry_a.name),
+                Press(("j",)),
+                Assert(lambda p: tree.cursor_node.data == entry_b.name),
+                Press(("k",)),
+                Assert(lambda p: tree.cursor_node.data == entry_a.name),
+            )
+
+    _run(_test())
+
+
+def test_data_preview_hidden_by_default(catalog):
+    async def _test():
+        app = _make_tui(catalog)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await settle(pilot)
+            panel = app.screen.query_one("#data-preview-panel")
+            assert panel.display is False
+
+    _run(_test())
+
+
+def test_lineage_panel_exists(catalog: Catalog) -> None:
+    async def _test():
+        app = _make_tui(catalog)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await settle(pilot)
+            lineage = app.screen.query_one("#lineage-panel")
+            assert lineage.border_title == "Lineage"
+
+    _run(_test())
+
+
+def test_lineage_is_the_default_view(catalog: Catalog) -> None:
+    """1/2/3 swap one panel into the right column; lineage is what you land on."""
+
+    async def _test():
+        app = _make_tui(catalog)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await settle(pilot)
+            screen = app.screen
+            assert screen._active_view == "lineage"
+            assert screen.query_one("#lineage-panel").display is True
+            assert screen.query_one("#sql-panel").display is False
+            assert screen.query_one("#data-preview-panel").display is False
+
+    _run(_test())
+
+
+def test_render_refresh_populates_tree(catalog, entry_a, entry_b):
+    async def _test():
+        app = _make_tui(catalog)
+        rows = (CatalogRowData(entry=entry_a), CatalogRowData(entry=entry_b))
+        async with app.run_test(size=(120, 40)) as pilot:
+            await settle(pilot)
+            screen = app.screen
+            assert isinstance(screen, CatalogScreen)
+
+            screen._render_refresh(catalog.repo.working_dir, rows)
+            await settle(pilot)
+
+            tree = screen.query_one("#catalog-tree", Tree)
+            # Both entries are "source" kind → one branch with 2 leaves
+            assert len(tree.root.children) == 1
+            branch = tree.root.children[0]
+            assert "source" in str(branch.label)
+            assert len(branch.children) == 2
+
+    _run(_test())
+
+
+def test_render_refresh_uses_entry_name_as_node_data(catalog, entry_a, entry_b):
+    async def _test():
+        app = _make_tui(catalog)
+        rows = (CatalogRowData(entry=entry_a), CatalogRowData(entry=entry_b))
+        async with app.run_test(size=(120, 40)) as pilot:
+            await settle(pilot)
+            screen = app.screen
+
+            screen._render_refresh(catalog.repo.working_dir, rows)
+            await settle(pilot)
+
+            hashes = screen._tree_entry_hashes()
+            assert entry_a.name in hashes
+            assert entry_b.name in hashes
+
+    _run(_test())
+
+
+def test_render_status_updates_status_bar(catalog):
+    async def _test():
+        app = _make_tui(catalog)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await settle(pilot)
+            screen = app.screen
+            repo_path = catalog.repo.working_dir
+            screen._render_status("12:00:00", repo_path)
+            await settle(pilot)
+
+            status = screen.query_one("#status-bar", Static)
+            text = status.content
+            assert "12:00:00" in text
+            assert repo_path in text
+
+    _run(_test())
+
+
+def test_two_aliases_same_entry_produce_one_leaf(catalog, entry_a):
+    async def _test():
+        catalog.add_alias(entry_a.name, "latest")
+        catalog.add_alias(entry_a.name, "v1")
+        app = _make_tui(catalog)
+        row = CatalogRowData(entry=entry_a, aliases=("latest", "v1"))
+        async with app.run_test(size=(120, 40)) as pilot:
+            await settle(pilot)
+            screen = app.screen
+            assert isinstance(screen, CatalogScreen)
+
+            screen._render_refresh(catalog.repo.working_dir, (row,))
+            await settle(pilot)
+
+            hashes = screen._tree_entry_hashes()
+            assert entry_a.name in hashes
+            assert len(hashes) == 1
+
+    _run(_test())
+
+
+def test_unaliased_entry_uses_name_in_tree(catalog, entry_a):
+    async def _test():
+        app = _make_tui(catalog)
+        row = CatalogRowData(entry=entry_a, aliases=())
+        async with app.run_test(size=(120, 40)) as pilot:
+            await settle(pilot)
+            screen = app.screen
+
+            screen._render_refresh(catalog.repo.working_dir, (row,))
+            await settle(pilot)
+
+            hashes = screen._tree_entry_hashes()
+            assert entry_a.name in hashes
+            assert len(hashes) == 1
+
+    _run(_test())
+
+
+def _leaf_label_for(screen: CatalogScreen, entry_hash: str) -> str:
+    tree = screen.query_one("#catalog-tree", Tree)
+    return next(
+        str(leaf.label)
+        for branch in tree.root.children
+        for leaf in branch.children
+        if leaf.data == entry_hash
+    )
+
+
+def test_refresh_attaches_alias_added_after_entry_cached(
+    catalog: Catalog, entry_a: CatalogEntry
+) -> None:
+    """A refresh landing mid-add caches the entry before its alias write;
+    the next refresh must attach the alias to the cached row instead of
+    leaving the entry permanently rendered as a bare hash."""
+
+    async def _test():
+        app = _make_tui(catalog)
+        async with app.run_test(size=(120, 40)) as pilot:
+            # Phase 1 of the add: entry in catalog.yaml, alias not yet.
+            screen, _ = await _populate_tree(pilot, catalog, entry_a)
+            assert screen._row_cache[entry_a.name].aliases == ()
+
+            # Phase 2: the alias write lands.
+            catalog.add_alias(entry_a.name, "my-model")
+
+            # Run the refresh body off the main thread, as the worker does.
+            await asyncio.to_thread(screen._do_refresh_locked)
+            await settle(pilot)
+
+            assert screen._row_cache[entry_a.name].aliases == ("my-model",)
+            assert "my-model" in _leaf_label_for(screen, entry_a.name)
+
+    _run(_test())
+
+
+def test_refresh_moves_alias_repointed_to_new_entry(
+    catalog: Catalog, entry_a: CatalogEntry
+) -> None:
+    """Adding a new revision under an existing alias re-points the alias;
+    the old entry's cached row must lose it and the new entry must show it."""
+
+    async def _test():
+        catalog.add_alias(entry_a.name, "latest")
+        app = _make_tui(catalog)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await settle(pilot)
+            screen = pilot.app.screen
+            row = CatalogRowData(entry=entry_a, aliases=("latest",))
+            screen._row_cache = {row.row_key: row}
+            screen._render_refresh(catalog.repo.working_dir, (row,))
+            await settle(pilot)
+
+            entry_c = catalog.add(xo.memtable({"z": [1, 2]}), aliases=("latest",))
+
+            await asyncio.to_thread(screen._do_refresh_locked)
+            await settle(pilot)
+
+            assert screen._row_cache[entry_a.name].aliases == ()
+            assert screen._row_cache[entry_c.name].aliases == ("latest",)
+            assert "latest" not in _leaf_label_for(screen, entry_a.name)
+            assert "latest" in _leaf_label_for(screen, entry_c.name)
+
+    _run(_test())
+
+
+def _alias_target(aliases: tuple, alias: str) -> str:
+    return next(ca.catalog_entry.name for ca in aliases if ca.alias == alias)
+
+
+def test_get_catalog_aliases_sees_pure_repoint(
+    catalog: Catalog, entry_a: CatalogEntry, entry_b: CatalogEntry
+) -> None:
+    """A pure repoint rewrites only the aliases/ symlink; catalog.yaml already
+    lists the alias, so its mtime alone must not key the cache."""
+    catalog.add_alias(entry_a.name, "latest")
+    yaml_path = catalog.catalog_yaml.yaml_path
+    yaml_mtime = yaml_path.stat().st_mtime
+
+    before = _get_catalog_aliases(catalog)
+    assert _alias_target(before, "latest") == entry_a.name
+
+    catalog.add_alias(entry_b.name, "latest")
+    # the repoint must not have rewritten catalog.yaml, or this test would
+    # pass via the yaml mtime without exercising the symlink-state key
+    assert yaml_path.stat().st_mtime == yaml_mtime
+
+    after = _get_catalog_aliases(catalog)
+    assert _alias_target(after, "latest") == entry_b.name
+
+
+def test_refresh_moves_alias_repointed_between_existing_entries(
+    catalog: Catalog, entry_a: CatalogEntry, entry_b: CatalogEntry
+) -> None:
+    """A pure repoint between two existing entries touches only the aliases/
+    symlink, not catalog.yaml; the refresh must still move the alias."""
+
+    async def _test():
+        catalog.add_alias(entry_a.name, "latest")
+        app = _make_tui(catalog)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await settle(pilot)
+            screen = pilot.app.screen
+            rows = (
+                CatalogRowData(entry=entry_a, aliases=("latest",)),
+                CatalogRowData(entry=entry_b),
+            )
+            screen._row_cache = {r.row_key: r for r in rows}
+            screen._render_refresh(catalog.repo.working_dir, rows)
+            await settle(pilot)
+
+            # Prime the mtime-keyed alias cache with the pre-repoint state.
+            await asyncio.to_thread(screen._do_refresh_locked)
+            await settle(pilot)
+            assert screen._row_cache[entry_a.name].aliases == ("latest",)
+
+            catalog.add_alias(entry_b.name, "latest")
+
+            await asyncio.to_thread(screen._do_refresh_locked)
+            await settle(pilot)
+
+            assert screen._row_cache[entry_a.name].aliases == ()
+            assert screen._row_cache[entry_b.name].aliases == ("latest",)
+            assert "latest" not in _leaf_label_for(screen, entry_a.name)
+            assert "latest" in _leaf_label_for(screen, entry_b.name)
+
+    _run(_test())
+
+
+def test_cursor_move_updates_schema_preview(
+    catalog: Catalog, entry_a: CatalogEntry, entry_b: CatalogEntry
+) -> None:
+    async def _test():
+        app = _make_tui(catalog)
+        rows = (
+            CatalogRowData(entry=entry_a, aliases=("a",)),
+            CatalogRowData(entry=entry_b, aliases=("b",)),
+        )
+        async with app.run_test(size=(120, 40)) as pilot:
+            await settle(pilot)
+            screen = app.screen
+            assert isinstance(screen, CatalogScreen)
+
+            screen._row_cache = {r.row_key: r for r in rows}
+            screen._render_refresh(catalog.repo.working_dir, rows)
+            await settle(pilot)
+
+            schema_table = screen.query_one("#schema-preview-table", DataTable)
+
+            await run_script(
+                pilot,
+                # Move past branch to first leaf (entry_a: id, name, score).
+                # Panel render is debounced, so wait for it to settle.
+                Press(("j",)),
+                WaitUntil(lambda: schema_table.row_count == 3),
+                Assert(
+                    lambda p: (
+                        "id" in [schema_table.get_cell_at((i, 0)) for i in range(3)]
+                    )
+                ),
+                Assert(
+                    lambda p: (
+                        "name" in [schema_table.get_cell_at((i, 0)) for i in range(3)]
+                    )
+                ),
+                Assert(
+                    lambda p: (
+                        "score" in [schema_table.get_cell_at((i, 0)) for i in range(3)]
+                    )
+                ),
+                # Move to second leaf (entry_b: value)
+                Press(("j",)),
+                WaitUntil(lambda: schema_table.row_count == 1),
+                Assert(lambda p: schema_table.get_cell_at((0, 0)) == "value"),
+                # Move back to first leaf (entry_a: id, name, score)
+                Press(("k",)),
+                WaitUntil(lambda: schema_table.row_count == 3),
+            )
+
+    _run(_test())
+
+
+def test_schema_preview_empty_before_selection(catalog):
+    async def _test():
+        app = _make_tui(catalog)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await settle(pilot)
+            schema_table = app.screen.query_one("#schema-preview-table", DataTable)
+            assert schema_table.row_count == 0
+
+    _run(_test())
+
+
+def test_view_switching_1_2_3(catalog: Catalog) -> None:
+    async def _test():
+        app = _make_tui(catalog)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await settle(pilot)
+            screen = app.screen
+
+            lineage_panel = screen.query_one("#lineage-panel")
+            sql_panel = screen.query_one("#sql-panel")
+            data_panel = screen.query_one("#data-preview-panel")
+
+            await run_script(
+                pilot,
+                # Default: lineage visible, sql and data hidden
+                Assert(lambda p: lineage_panel.display is True),
+                Assert(lambda p: sql_panel.display is False),
+                Assert(lambda p: data_panel.display is False),
+                # Switch to SQL
+                Press(("2",)),
+                Assert(lambda p: lineage_panel.display is False),
+                Assert(lambda p: sql_panel.display is True),
+                Assert(lambda p: data_panel.display is False),
+                # Switch to data
+                Press(("3",)),
+                Assert(lambda p: lineage_panel.display is False),
+                Assert(lambda p: sql_panel.display is False),
+                Assert(lambda p: data_panel.display is True),
+                # Switch back to lineage
+                Press(("1",)),
+                Assert(lambda p: lineage_panel.display is True),
+                Assert(lambda p: sql_panel.display is False),
+                Assert(lambda p: data_panel.display is False),
+            )
+
+    _run(_test())
+
+
+def test_sql_preview_renders_only_while_the_sql_view_is_active(
+    catalog: Catalog, entry_a: CatalogEntry, entry_b: CatalogEntry
+) -> None:
+    """SQL highlighting costs a worker per selection, so browsing lineage must
+    not render it; switching to the SQL view renders the current selection."""
+
+    async def _test():
+        app = _make_tui(catalog)
+        rows = (
+            CatalogRowData(entry=entry_a, aliases=("a",)),
+            CatalogRowData(entry=entry_b, aliases=("b",)),
+        )
+        async with app.run_test(size=(120, 40)) as pilot:
+            await settle(pilot)
+            screen = app.screen
+            assert isinstance(screen, CatalogScreen)
+
+            screen._row_cache = {r.row_key: r for r in rows}
+            screen._render_refresh(catalog.repo.working_dir, rows)
+            await settle(pilot)
+
+            schema_table = screen.query_one("#schema-preview-table", DataTable)
+
+            await run_script(
+                pilot,
+                # Move past branch to first leaf: schema renders, SQL does not.
+                Press(("j",)),
+                WaitUntil(lambda: schema_table.row_count == 3),
+                Assert(lambda p: screen._current_sql_hash is None),
+                # Switching to the SQL view renders the selection on demand.
+                Press(("2",)),
+                Assert(lambda p: screen._current_sql_hash == rows[0].row_key),
+                # Leaving the view clears the guard so re-entry re-renders.
+                Press(("1",)),
+                Assert(lambda p: screen._current_sql_hash is None),
+            )
+
+    _run(_test())
+
+
+def test_v_toggles_revisions(catalog: Catalog) -> None:
+    async def _test():
+        app = _make_tui(catalog)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await settle(pilot)
+            panel = app.screen.query_one("#revisions-panel")
+
+            await run_script(
+                pilot,
+                Assert(lambda p: panel.display is False),
+                Press(("v",)),
+                Assert(lambda p: panel.display is True),
+                Press(("v",)),
+                Assert(lambda p: panel.display is False),
+            )
+
+    _run(_test())
+
+
+def test_list_revisions_cached_hits_and_invalidates(catalog, entry_a, alias_for_a):
+    """Same (alias, HEAD sha) hits cache; a new commit invalidates it."""
+    _list_revisions_cached.cache_clear()
+    alias = CatalogAlias.from_name(alias_for_a, catalog)
+    sha = catalog.repo.head.commit.hexsha
+
+    first = _list_revisions_cached(alias, sha)
+    # Identical args -> cache hit returns the same object (no re-walk).
+    assert _list_revisions_cached(alias, sha) is first
+
+    # A distinct but value-equal alias (CatalogAlias is @frozen) hits the same
+    # cache entry -- the production path after _catalog_aliases_cached rebuilds
+    # alias objects on a YAML mtime change.
+    alias2 = CatalogAlias.from_name(alias_for_a, catalog)
+    assert alias2 is not alias
+    assert _list_revisions_cached(alias2, sha) is first
+
+    # A new commit moves HEAD -> different key -> fresh walk.
+    catalog.add_alias(entry_a.name, "another-alias")
+    sha2 = catalog.repo.head.commit.hexsha
+    assert sha2 != sha
+    assert _list_revisions_cached(alias, sha2) is not first
+
+
+def test_tree_entry_hashes_helper(catalog, entry_a, entry_b):
+    async def _test():
+        app = _make_tui(catalog)
+        async with app.run_test(size=(120, 40)) as pilot:
+            screen, _ = await _populate_tree(pilot, catalog, entry_a, entry_b)
+            hashes = screen._tree_entry_hashes()
+            assert entry_a.name in hashes
+            assert entry_b.name in hashes
+            assert len(hashes) == 2
+
+    _run(_test())
+
+
+# ---------------------------------------------------------------------------
+# 5. Git Log: unit tests
+# ---------------------------------------------------------------------------
+
+
+def test_git_log_row_data_row_tuple():
+    row = GitLogRowData(
+        hash="abc123def456", date="2025-01-15 10:30", message="initial commit"
+    )
+    assert row.row == ("abc123def456", "2025-01-15 10:30", "initial commit")
+
+
+def test_git_log_row_data_defaults():
+    row = GitLogRowData()
+    assert row.row == ("", "", "")
+
+
+def test_git_log_row_data_is_frozen():
+    row = GitLogRowData(hash="abc")
+    with pytest.raises(AttributeError):
+        row.hash = "new"
+
+
+def test_builds_from_real_catalog_commits(catalog, entry_a, entry_b):
+    rows = _build_git_log_rows(catalog.repo, max_count=50)
+    # init + add catalog.yaml + add entry_a + add entry_b = at least 4 commits
+    assert len(rows) >= 4
+    for row in rows:
+        assert len(row.hash) == 12
+        assert row.date != ""
+        assert row.message != ""
+
+
+def test_max_count_limits_output(catalog, entry_a, entry_b):
+    one_row = _build_git_log_rows(catalog.repo, max_count=1)
+    assert len(one_row) == 1
+
+
+def test_empty_catalog_has_initial_commit(catalog):
+    rows = _build_git_log_rows(catalog.repo)
+    assert len(rows) >= 1
+
+
+# ---------------------------------------------------------------------------
+# 5. Git Log: pilot tests
+# ---------------------------------------------------------------------------
+
+
+def test_git_log_panel_hidden_by_default(catalog):
+    async def _test():
+        app = _make_tui(catalog)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await settle(pilot)
+            panel = app.screen.query_one("#git-log-panel")
+            assert panel.display is False
+
+    _run(_test())
+
+
+def test_g_toggles_git_log_visibility(catalog):
+    async def _test():
+        app = _make_tui(catalog)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await settle(pilot)
+            panel = app.screen.query_one("#git-log-panel")
+
+            await run_script(
+                pilot,
+                Assert(lambda p: panel.display is False),
+                Press(("g",)),
+                Assert(lambda p: panel.display is True),
+                Press(("g",)),
+                Assert(lambda p: panel.display is False),
+            )
+
+    _run(_test())
+
+
+def test_git_log_table_has_correct_columns(catalog):
+    async def _test():
+        app = _make_tui(catalog)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await settle(pilot)
+            git_table = app.screen.query_one("#git-log-table", DataTable)
+            col_labels = tuple(col.label.plain for col in git_table.columns.values())
+            assert col_labels == GIT_LOG_COLUMNS
+
+    _run(_test())
+
+
+def test_git_log_panel_border_title(catalog):
+    async def _test():
+        app = _make_tui(catalog)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await settle(pilot)
+            panel = app.screen.query_one("#git-log-panel")
+            assert panel.border_title == "Git Log"
+
+    _run(_test())
+
+
+def test_render_git_log_populates_table(catalog):
+    async def _test():
+        app = _make_tui(catalog)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await settle(pilot)
+            screen = app.screen
+            assert isinstance(screen, CatalogScreen)
+
+            rows = (
+                GitLogRowData(hash="aabb", date="2025-01-01 10:00", message="first"),
+                GitLogRowData(hash="ccdd", date="2025-01-02 11:00", message="second"),
+            )
+            screen._render_git_log(rows)
+            await settle(pilot)
+
+            git_table = screen.query_one("#git-log-table", DataTable)
+            assert git_table.row_count == 2
+            assert git_table.get_cell_at((0, 0)) == "aabb"
+            assert git_table.get_cell_at((0, 2)) == "first"
+            assert git_table.get_cell_at((1, 0)) == "ccdd"
+
+    _run(_test())
+
+
+def test_toggle_triggers_load_from_real_repo(catalog, entry_a):
+    async def _test():
+        app = _make_tui(catalog)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await settle(pilot)
+            await pilot.press("g")
+            git_table = app.screen.query_one("#git-log-table", DataTable)
+            await wait_until(pilot, lambda: git_table.row_count >= 3)
+
+    _run(_test())
+
+
+# ---------------------------------------------------------------------------
+# 6. _entry_info: reads from real CatalogEntry
+# ---------------------------------------------------------------------------
+
+
+def test_entry_info(entry_b):
+    """_entry_info reads column count from expr_metadata; cached is None for plain memtables."""
+    column_count, cached = _entry_info(entry_b)
+    assert column_count == 1  # single column: value
+    assert not cached
+
+
+def test_entry_info_three_columns(entry_a):
+    """_entry_info reports the correct column count for a multi-column expression."""
+    column_count, cached = _entry_info(entry_a)
+    assert column_count == 3  # id, name, score
+    assert not cached
+
+
+def test_entry_info_scalar_expression_wraps_as_table(catalog):
+    """Scalar expressions are wrapped with as_table() at catalog-save time so
+    column_count is the number of columns of the resulting table (always 1)."""
+    t = xo.memtable({"a": [1, 2, 3]})
+    entry = catalog.add(t.a.sum())
+    column_count, cached = _entry_info(entry)
+    assert column_count == 1
+    assert not cached
+
+
+def test_cached_false_before_execution(catalog, tmp_path, parquet_dir):
+    con = xo.duckdb.connect()
+    t = deferred_read_parquet(
+        parquet_dir / "astronauts.parquet", con, table_name="astronauts"
+    )
+    cache = ParquetSnapshotCache.from_kwargs(relative_path=tmp_path / "cache")
+    expr = t.cache(cache=cache)
+    entry = catalog.add(expr)
+
+    path = get_cache_key_path(entry.projected_cache_key)
+    assert path is not None, "entry must have a cache key path"
+    assert not Path(path).exists()
+    assert CatalogRowData(entry=entry).cached is False
+    _, cached = _entry_info(entry)
+    assert cached is False
+
+
+def test_cached_true_after_execution(catalog, tmp_path, parquet_dir):
+    con = xo.duckdb.connect()
+    t = deferred_read_parquet(
+        parquet_dir / "astronauts.parquet", con, table_name="astronauts"
+    )
+    cache = ParquetSnapshotCache.from_kwargs(relative_path=tmp_path / "cache")
+    expr = t.cache(cache=cache)
+    entry = catalog.add(expr)
+    entry.expr.execute()
+
+    path = get_cache_key_path(entry.projected_cache_key)
+    assert path is not None and Path(path).exists()
+    assert CatalogRowData(entry=entry).cached is True
+    _, cached = _entry_info(entry)
+    assert cached is True
+
+
+# ---------------------------------------------------------------------------
+# 11. DataViewScreen: pilot tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def _mock_catalog_run(monkeypatch):
+    """Bypass xorq catalog subprocess — execute the expression in-process."""
+    monkeypatch.setattr(
+        DataViewScreen,
+        "_run_catalog_subprocess",
+        lambda self, code=None: self._entry.expr.limit(50_000).execute(),
+    )
+
+
+def _raise_load_error(self, code=None):
+    raise RuntimeError("mock load error")
+
+
+@pytest.fixture
+def _mock_catalog_run_error(monkeypatch):
+    """Make every subprocess call fail with RuntimeError."""
+    monkeypatch.setattr(DataViewScreen, "_run_catalog_subprocess", _raise_load_error)
+
+
+def test_data_view_screen_construction(entry_a):
+    row_data = CatalogRowData(entry=entry_a)
+    screen = DataViewScreen(entry=entry_a, row_data=row_data)
+    assert screen._entry is entry_a
+    assert screen._row_data is row_data
+    assert screen._df is None
+
+
+def test_e_pushes_data_view_screen(catalog, entry_a, _mock_catalog_run):
+    async def _test():
+        app = _make_tui(catalog)
+        async with app.run_test(size=(120, 40)) as pilot:
+            screen, _ = await _populate_tree(pilot, catalog, entry_a)
+            tree = screen.query_one("#catalog-tree", Tree)
+
+            await run_script(
+                pilot,
+                Press(("j",)),  # move to first leaf
+                Assert(lambda p: tree.cursor_node.data == entry_a.name),
+                Press(("e",)),
+            )
+            await settle(pilot)
+            assert isinstance(app.screen, DataViewScreen)
+
+    _run(_test())
+
+
+def test_e_on_branch_does_nothing(catalog, entry_a):
+    async def _test():
+        app = _make_tui(catalog)
+        async with app.run_test(size=(120, 40)) as pilot:
+            screen, _ = await _populate_tree(pilot, catalog, entry_a)
+            tree = screen.query_one("#catalog-tree", Tree)
+
+            # Cursor starts on branch node ("source")
+            assert tree.cursor_node.data == "source"
+            await pilot.press("e")
+            await settle(pilot)
+            assert isinstance(app.screen, CatalogScreen)
+
+    _run(_test())
+
+
+def test_data_view_escape_returns(catalog, entry_a, _mock_catalog_run):
+    async def _test():
+        app = _make_tui(catalog)
+        async with app.run_test(size=(120, 40)) as pilot:
+            screen, _ = await _populate_tree(pilot, catalog, entry_a)
+
+            await run_script(
+                pilot,
+                Press(("j",)),
+                Press(("e",)),
+            )
+            await settle(pilot)
+            assert isinstance(app.screen, DataViewScreen)
+            await pilot.press("escape")
+            await settle(pilot)
+            assert isinstance(app.screen, CatalogScreen)
+
+    _run(_test())
+
+
+def test_data_view_loads_data(catalog, entry_a, _mock_catalog_run):
+    async def _test():
+        app = _make_tui(catalog)
+        async with app.run_test(size=(120, 40)) as pilot:
+            screen, _ = await _populate_tree(pilot, catalog, entry_a)
+
+            await run_script(
+                pilot,
+                Press(("j",)),
+                Press(("e",)),
+            )
+            await settle(pilot)
+            data_screen = app.screen
+            assert isinstance(data_screen, DataViewScreen)
+
+            data_table = data_screen.query_one("#data-view-table", DataTable)
+            await wait_until(pilot, lambda: data_table.row_count > 0)
+            # entry_a has 2 rows: alice, bob
+            assert data_table.row_count == 2
+
+    _run(_test())
+
+
+def test_cached_display_reflects_execution_state(catalog, tmp_path, parquet_dir):
+    con = xo.duckdb.connect()
+    t = deferred_read_parquet(
+        parquet_dir / "astronauts.parquet", con, table_name="astronauts"
+    )
+    cache = ParquetSnapshotCache.from_kwargs(relative_path=tmp_path / "cache")
+    expr = t.cache(cache=cache)
+    entry = catalog.add(expr)
+
+    assert CatalogRowData(entry=entry).cached_display == "○"
+    entry.expr.execute()
+    assert CatalogRowData(entry=entry).cached_display == "●"
+
+
+def test_memtable_cached_lifecycle(catalog, tmp_path):
+    cache = ParquetSnapshotCache.from_kwargs(relative_path=tmp_path / "cache")
+    expr = xo.memtable({"x": [1, 2, 3]}).cache(cache=cache)
+    entry = catalog.add(expr)
+
+    path = get_cache_key_path(entry.projected_cache_key)
+    assert path is not None, "entry must have a cache key path"
+    assert CatalogRowData(entry=entry).cached is False
+
+    entry.expr.execute()
+    assert CatalogRowData(entry=entry).cached is True
+
+
+# ---------------------------------------------------------------------------
+# 12. ExprStack: pure unit tests
+# ---------------------------------------------------------------------------
+
+
+def test_expr_step_is_frozen():
+    step = ExprStep(
+        verb="filter", user_input="source.x > 1", code="source.filter(source.x > 1)"
+    )
+    with pytest.raises(AttributeError):
+        step.verb = "mutate"
+
+
+def test_expr_stack_initial_state():
+    base = xo.memtable({"x": [1, 2, 3]})
+    stack = ExprStack(base_expr=base)
+    assert stack.cursor == 0
+    assert stack.steps == ()
+    assert stack.current_code == ""
+    assert not stack.can_undo
+    assert not stack.can_redo
+
+
+def test_expr_stack_push():
+    base = xo.memtable({"x": [1, 2, 3]})
+    stack = ExprStack(base_expr=base)
+    step = ExprStep(
+        verb="filter", user_input="source.x > 1", code="source.filter(source.x > 1)"
+    )
+    stack2 = stack.push(step)
+    assert stack2.cursor == 1
+    assert len(stack2.steps) == 1
+    assert stack2.steps[0] is step
+    # original unchanged (immutable)
+    assert stack.cursor == 0
+    assert len(stack.steps) == 0
+
+
+def test_expr_stack_undo_redo():
+    base = xo.memtable({"x": [1, 2, 3]})
+    step = ExprStep(
+        verb="filter", user_input="source.x > 1", code="source.filter(source.x > 1)"
+    )
+    stack = ExprStack(base_expr=base).push(step)
+    assert stack.can_undo
+    assert not stack.can_redo
+
+    undone = stack.undo()
+    assert undone.cursor == 0
+    assert not undone.can_undo
+    assert undone.can_redo
+
+    redone = undone.redo()
+    assert redone.cursor == 1
+    assert redone.can_undo
+    assert not redone.can_redo
+
+
+def test_expr_stack_undo_at_zero():
+    base = xo.memtable({"x": [1, 2, 3]})
+    stack = ExprStack(base_expr=base)
+    assert stack.undo().cursor == 0
+
+
+def test_expr_stack_redo_at_end():
+    base = xo.memtable({"x": [1, 2, 3]})
+    step = ExprStep(
+        verb="filter", user_input="source.x > 1", code="source.filter(source.x > 1)"
+    )
+    stack = ExprStack(base_expr=base).push(step)
+    assert stack.redo().cursor == 1
+
+
+def test_expr_stack_fork_discards_after_cursor():
+    base = xo.memtable({"x": [1, 2, 3]})
+    step1 = ExprStep(
+        verb="filter", user_input="source.x > 1", code="source.filter(source.x > 1)"
+    )
+    step2 = ExprStep(
+        verb="mutate", user_input="y=source.x * 2", code="source.mutate(y=source.x * 2)"
+    )
+    stack = ExprStack(base_expr=base).push(step1).push(step2)
+    assert stack.cursor == 2
+
+    # Undo to step 1, then push a new step — step2 should be discarded
+    undone = stack.undo()
+    assert undone.cursor == 1
+    step3 = ExprStep(verb="select", user_input='"x"', code='source.select("x")')
+    forked = undone.push(step3)
+    assert forked.cursor == 2
+    assert len(forked.steps) == 2
+    assert forked.steps[1] is step3  # step2 was replaced
+
+
+def test_expr_stack_current_code():
+    base = xo.memtable({"x": [1, 2, 3]})
+    step1 = ExprStep(
+        verb="filter", user_input="source.x > 1", code="source.filter(source.x > 1)"
+    )
+    step2 = ExprStep(
+        verb="mutate", user_input="y=source.x * 2", code="source.mutate(y=source.x * 2)"
+    )
+    stack = ExprStack(base_expr=base).push(step1).push(step2)
+    code = stack.current_code
+    # Each step is wrapped in a lambda so its `source` binds to the prior result.
+    assert code == (
+        "(lambda source: source.mutate(y=source.x * 2))"
+        "((lambda source: source.filter(source.x > 1))(source))"
+    )
+
+
+def test_expr_stack_current_code_single_step():
+    base = xo.memtable({"x": [1, 2, 3]})
+    step = ExprStep(
+        verb="filter", user_input="source.x > 1", code="source.filter(source.x > 1)"
+    )
+    stack = ExprStack(base_expr=base).push(step)
+    assert stack.current_code == "(lambda source: source.filter(source.x > 1))(source)"
+
+
+def test_expr_stack_current_code_evaluable():
+    """current_code must be a single expression that _eval_code can evaluate."""
+
+    base = xo.memtable({"x": [1, 2, 3], "y": [10, 20, 30]})
+    step1 = ExprStep(
+        verb="filter", user_input="source.x > 1", code="source.filter(source.x > 1)"
+    )
+    step2 = ExprStep(
+        verb="filter", user_input="source.y < 25", code="source.filter(source.y < 25)"
+    )
+    stack = ExprStack(base_expr=base).push(step1).push(step2)
+    result = _eval_code(stack.current_code, base)
+    df = result.execute()
+    assert len(df) == 1
+    assert list(df["x"]) == [2]
+    assert list(df["y"]) == [20]
+
+
+def test_expr_stack_current_code_inner_source_rebinds():
+    """Every `source` in a step must bind to the prior step's result, not only the first."""
+
+    base = xo.memtable({"x": [1, 2, 3], "y": [10, 20, 30]})
+    step1 = ExprStep(
+        verb="freeform",
+        user_input='source.select("x")',
+        code='source.select("x")',
+    )
+    # This step references source.x; after select("x"), source.y is gone.
+    # If `source` inside the mutate bound to the original base, this would
+    # silently succeed using base.x rather than the selected projection.
+    step2 = ExprStep(
+        verb="freeform",
+        user_input="source.mutate(z=source.x * 10)",
+        code="source.mutate(z=source.x * 10)",
+    )
+    stack = ExprStack(base_expr=base).push(step1).push(step2)
+    result = _eval_code(stack.current_code, base)
+    df = result.execute()
+    assert list(df.columns) == ["x", "z"]
+    assert list(df["z"]) == [10, 20, 30]
+
+
+# ---------------------------------------------------------------------------
+# 13. DataViewScreen compose: pilot tests
+# ---------------------------------------------------------------------------
+
+
+def test_data_view_has_command_input_hidden(catalog, entry_a):
+    async def _test():
+        app = _make_tui(catalog)
+        async with app.run_test(size=(120, 40)) as pilot:
+            screen, _ = await _populate_tree(pilot, catalog, entry_a)
+
+            await run_script(
+                pilot,
+                Press(("j",)),
+                Press(("e",)),
+            )
+            await settle(pilot)
+            assert isinstance(app.screen, DataViewScreen)
+
+            cmd = app.screen.query_one("#command-input", Input)
+            assert cmd.display is False
+
+    _run(_test())
+
+
+def test_data_view_colon_opens_freeform_input(catalog, entry_a):
+    async def _test():
+        app = _make_tui(catalog)
+        async with app.run_test(size=(120, 40)) as pilot:
+            screen, _ = await _populate_tree(pilot, catalog, entry_a)
+
+            await run_script(
+                pilot,
+                Press(("j",)),
+                Press(("e",)),
+            )
+            await settle(pilot)
+            data_screen = app.screen
+            assert isinstance(data_screen, DataViewScreen)
+
+            data_table = data_screen.query_one("#data-view-table", DataTable)
+            await wait_until(pilot, lambda: data_table.row_count > 0)
+
+            await pilot.press(":")
+            await settle(pilot)
+
+            cmd = data_screen.query_one("#command-input", Input)
+            assert cmd.display is True
+            assert ":" in str(cmd.border_title)
+
+    _run(_test())
+
+
+def test_data_view_escape_closes_command_input(catalog, entry_a):
+    async def _test():
+        app = _make_tui(catalog)
+        async with app.run_test(size=(120, 40)) as pilot:
+            screen, _ = await _populate_tree(pilot, catalog, entry_a)
+
+            await run_script(
+                pilot,
+                Press(("j",)),
+                Press(("e",)),
+            )
+            await settle(pilot)
+            data_screen = app.screen
+            data_table = data_screen.query_one("#data-view-table", DataTable)
+            await wait_until(pilot, lambda: data_table.row_count > 0)
+
+            # Open command input
+            await pilot.press(":")
+            await settle(pilot)
+
+            cmd = data_screen.query_one("#command-input", Input)
+            assert cmd.display is True
+
+            # Escape closes it
+            await pilot.press("escape")
+            await settle(pilot)
+            assert cmd.display is False
+            # Still on DataViewScreen
+            assert isinstance(app.screen, DataViewScreen)
+
+    _run(_test())
+
+
+def test_data_view_stack_browser_toggle(catalog, entry_a):
+    async def _test():
+        app = _make_tui(catalog)
+        async with app.run_test(size=(120, 40)) as pilot:
+            screen, _ = await _populate_tree(pilot, catalog, entry_a)
+
+            await run_script(
+                pilot,
+                Press(("j",)),
+                Press(("e",)),
+            )
+            await settle(pilot)
+            data_screen = app.screen
+            assert isinstance(data_screen, DataViewScreen)
+
+            data_table = data_screen.query_one("#data-view-table", DataTable)
+            await wait_until(pilot, lambda: data_table.row_count > 0)
+
+            panel = data_screen.query_one("#stack-browser-panel")
+            assert panel.display is False
+
+            await run_script(
+                pilot,
+                Press(("s",)),
+                Assert(lambda p: panel.display is True),
+                Press(("s",)),
+                Assert(lambda p: panel.display is False),
+            )
+
+    _run(_test())
+
+
+def test_data_view_undo_redo_no_crash_when_empty(catalog, entry_a):
+    async def _test():
+        app = _make_tui(catalog)
+        async with app.run_test(size=(120, 40)) as pilot:
+            screen, _ = await _populate_tree(pilot, catalog, entry_a)
+
+            await run_script(
+                pilot,
+                Press(("j",)),
+                Press(("e",)),
+            )
+            await settle(pilot)
+            data_screen = app.screen
+            assert isinstance(data_screen, DataViewScreen)
+
+            data_table = data_screen.query_one("#data-view-table", DataTable)
+            await wait_until(pilot, lambda: data_table.row_count > 0)
+
+            # Undo/redo with empty stack should not crash
+            await pilot.press("u")
+            await settle(pilot)
+            await pilot.press("ctrl+r")
+            await settle(pilot)
+            assert isinstance(app.screen, DataViewScreen)
+
+    _run(_test())
+
+
+# ---------------------------------------------------------------------------
+# 5. TUI options
+# ---------------------------------------------------------------------------
+
+
+def test_tui_options_defaults():
+    cfg = TUI()
+    assert cfg.left_ratio == 2
+    assert cfg.right_ratio == 3
+    assert cfg.revisions_open is False
+    assert cfg.git_log_open is False
+    assert cfg.row_limit == 10000
+
+
+def test_tui_env_var_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("XORQ_TUI_LEFT_RATIO", "7")
+    monkeypatch.setenv("XORQ_TUI_REVISIONS_OPEN", "True")
+    monkeypatch.setenv("XORQ_TUI_ROW_LIMIT", "42")
+    fresh = EnvConfigable.subclass_from_env_file(
+        env_templates_dir.joinpath(".env.xorq.template")
+    ).from_env()
+    assert fresh.XORQ_TUI_LEFT_RATIO == "7"
+    assert fresh.XORQ_TUI_REVISIONS_OPEN == "True"
+    assert fresh.XORQ_TUI_ROW_LIMIT == "42"
+
+
+@pytest.mark.parametrize(
+    ("row_limit", "expected"),
+    [
+        pytest.param(123, "123", id="normal"),
+        pytest.param(1, "1", id="min"),
+    ],
+)
+def test_catalog_run_cmd_uses_configured_row_limit(
+    entry_a: CatalogEntry, row_limit: int, expected: str
+) -> None:
+    row_data = CatalogRowData(entry=entry_a)
+    screen = DataViewScreen(entry=entry_a, row_data=row_data)
+    with (
+        patch.object(
+            screen, "_catalog_base_cmd", return_value=["xorq", "catalog", "run", "x"]
+        ),
+        options.tui({"row_limit": row_limit}),
+    ):
+        cmd = screen._catalog_run_cmd()
+    # assert on the contiguous flag/value pair, not a bare index lookup, so a
+    # future combined --limit=<n> form fails loudly rather than silently.
+    assert ["--limit", expected] in [cmd[i : i + 2] for i in range(len(cmd) - 1)], cmd
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        pytest.param("50000", 50000, id="passthrough"),
+        pytest.param("1", 1, id="min"),
+        pytest.param("0", 1, id="zero-clamped"),
+        pytest.param("-5", 1, id="negative-clamped"),
+        pytest.param(None, 10000, id="unset-default"),
+        pytest.param("", 10000, id="empty-default"),
+        pytest.param("abc", 10000, id="malformed-default"),
+    ],
+)
+def test_row_limit_clamp_and_default(
+    monkeypatch: pytest.MonkeyPatch, raw: str | None, expected: int
+) -> None:
+    # Exercise the real TUI.row_limit field definition in config.py: the field
+    # default is evaluated at import time against env_config, so reload the
+    # module with XORQ_TUI_ROW_LIMIT set to re-run the class body. Reading
+    # TUI().row_limit or options.tui({...}) would NOT hit the parse/clamp path
+    # (import-time eval, and context-manager overrides bypass the max(...,1)
+    # floor). Guards the floor (1) + default (10000) contract against drift.
+    if raw is None:
+        monkeypatch.delenv("XORQ_TUI_ROW_LIMIT", raising=False)
+    else:
+        monkeypatch.setenv("XORQ_TUI_ROW_LIMIT", raw)
+    try:
+        reloaded = importlib.reload(xorq.config)
+        assert reloaded.TUI().row_limit == expected
+    finally:
+        # restore module-global env_config/options to the unset-env defaults so
+        # later tests in this worker see the original config singletons.
+        monkeypatch.undo()
+        importlib.reload(xorq.config)
+
+
+def test_tui_options_apply_column_widths(catalog):
+    async def _test():
+        with options.tui(
+            {
+                "left_ratio": 5,
+                "right_ratio": 7,
+                "revisions_open": True,
+                "git_log_open": True,
+            }
+        ):
+            app = _make_tui(catalog)
+            async with app.run_test(size=(120, 40)) as pilot:
+                await settle(pilot)
+                screen = app.screen
+                assert str(screen.query_one("#left-column").styles.width) == "5fr"
+                assert str(screen.query_one("#right-column").styles.width) == "7fr"
+                assert screen.query_one("#revisions-panel").display is True
+                assert screen.query_one("#git-log-panel").display is True
+
+    _run(_test())
+
+
+def test_highlight_debounce_zero_renders_synchronously(catalog, entry_a, entry_b):
+    """delay <= 0 takes the synchronous render branch; no timer is scheduled."""
+    with options.tui({"highlight_debounce": 0.0}):
+
+        async def _test():
+            app = _make_tui(catalog)
+            async with app.run_test(size=(120, 40)) as pilot:
+                screen, _ = await _populate_tree(pilot, catalog, entry_a, entry_b)
+                await run_script(
+                    pilot,
+                    Press(("j",)),
+                    Assert(lambda p: screen._highlight_timer is None),
+                )
+
+        _run(_test())
+
+
+def test_cancel_highlight_timer_stops_pending(catalog):
+    """A pending timer is stopped and cleared by _cancel_highlight_timer."""
+
+    async def _test():
+        app = _make_tui(catalog)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await settle(pilot)
+            screen = app.screen
+            screen._highlight_timer = screen.set_timer(100, lambda: None)
+            screen._cancel_highlight_timer()
+            assert screen._highlight_timer is None
+
+    _run(_test())
+
+
+def test_on_unmount_cancels_pending_timer(catalog):
+    """Dismissing the screen with a timer pending cancels it (no NoMatches)."""
+
+    async def _test():
+        app = _make_tui(catalog)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await settle(pilot)
+            screen = app.screen
+            screen._highlight_timer = screen.set_timer(100, lambda: None)
+            screen.on_unmount()
+            assert screen._highlight_timer is None
+
+    _run(_test())
+
+
+def test_render_highlighted_node_noop_when_detached():
+    """An unmounted screen short-circuits before querying removed widgets."""
+    screen = CatalogScreen()
+    assert screen.is_attached is False
+    # query_one would raise NoMatches if the is_attached guard did not return.
+    screen._render_highlighted_node()
+    assert screen._highlight_timer is None
+
+
+def test_load_revisions_preview_renders_rows(catalog, entry_a, alias_for_a):
+    """Highlighting an aliased entry runs the worker: resolve HEAD, walk, render."""
+    _list_revisions_cached.cache_clear()
+    # debounce 0 -> _populate_tree's highlight renders synchronously, leaving no
+    # pending timer to fire mid-settle and clear the table after the worker runs.
+    with options.tui({"highlight_debounce": 0.0}):
+
+        async def _test():
+            app = _make_tui(catalog)
+            async with app.run_test(size=(120, 40)) as pilot:
+                screen, _ = await _populate_tree(pilot, catalog, entry_a)
+                alias = CatalogAlias.from_name(alias_for_a, catalog)
+                screen._load_revisions_preview(alias)
+                await settle(pilot)
+                rev_table = screen.query_one("#revisions-preview-table", DataTable)
+                assert rev_table.row_count >= 1
+
+        _run(_test())
+
+
+def test_load_revisions_preview_swallows_attribute_error(catalog, entry_a):
+    """A catalog_alias missing the repo attribute chain is caught, not raised."""
+
+    async def _test():
+        app = _make_tui(catalog)
+        async with app.run_test(size=(120, 40)) as pilot:
+            screen, _ = await _populate_tree(pilot, catalog, entry_a)
+            # object() has no .catalog_entry -> AttributeError inside the worker.
+            screen._load_revisions_preview(object())
+            await settle(pilot)
+            rev_table = screen.query_one("#revisions-preview-table", DataTable)
+            assert rev_table.row_count == 0
+
+    _run(_test())
+
+
+# ---------------------------------------------------------------------------
+# 14. SQL highlight pipeline: pure unit tests
+# ---------------------------------------------------------------------------
+
+
+def test_pygments_tokens_cached_returns_same_object():
+    r1 = _pygments_tokens("SELECT id FROM t")
+    r2 = _pygments_tokens("SELECT id FROM t")
+    assert r1 is r2
+
+
+def test_pygments_tokens_keyword_bold():
+    tokens = _pygments_tokens("SELECT 1")
+    select_styles = [s for v, s in tokens if v.strip().upper() == "SELECT"]
+    assert any("bold" in s for s in select_styles)
+
+
+def test_pygments_to_text_fresh_object_per_call():
+    t1 = _pygments_to_text("SELECT 1")
+    t2 = _pygments_to_text("SELECT 1")
+    assert t1 is not t2
+
+
+def test_pygments_to_text_word_wrap_config():
+    text = _pygments_to_text("SELECT 1")
+    assert text.no_wrap is False
+    assert text.overflow == "fold"
+
+
+def test_render_sql_text_fallback_for_large_query():
+    with options.tui({"sql_highlight_max_lines": 10}):
+        big_sql = "SELECT 1\n" * 11
+        text = _render_sql_text(big_sql)
+        plain = text.plain
+        assert plain.startswith("-- syntax highlighting disabled")
+        assert "10 lines" in plain
+        assert "SELECT 1" in plain
+
+
+def test_render_sql_text_disabled_when_max_lines_zero():
+    with options.tui({"sql_highlight_max_lines": 0}):
+        text = _render_sql_text("SELECT 1")
+        plain = text.plain
+        assert plain.startswith("-- syntax highlighting disabled\n")
+        assert "lines" not in plain.split("\n")[0]
+        assert "SELECT 1" in plain
+
+
+def test_render_sql_text_highlights_small_query():
+    text = _render_sql_text("SELECT 1")
+    assert text.no_wrap is False
+    assert not text.plain.startswith("-- syntax highlighting disabled")
+
+
+def test_render_sql_text_disabled_at_exact_boundary():
+    # raw.count("\n") == max_lines triggers >= guard → highlighting disabled
+    with options.tui({"sql_highlight_max_lines": 3}):
+        at_boundary = "SELECT 1\nFROM t\nWHERE x = 1\n"
+        assert at_boundary.count("\n") == 3
+        text = _render_sql_text(at_boundary)
+        assert text.plain.startswith("-- syntax highlighting disabled")
+
+
+# ---------------------------------------------------------------------------
+# 15. _render_sql_dag: pure unit tests
+# ---------------------------------------------------------------------------
+
+
+def test_render_sql_dag_empty() -> None:
+    assert _render_sql_dag(()) == ""
+
+
+def test_render_sql_dag_single() -> None:
+    result = _render_sql_dag((("main", "duckdb", "SELECT 1", ()),))
+    assert "-- [main] (duckdb)" in result
+    assert "SELECT 1" in result
+    assert "↓" not in result
+
+
+def test_render_sql_dag_single_non_main_name() -> None:
+    name = "abcdef1234567890abcdef12"
+    result = _render_sql_dag(((name, "duckdb", "SELECT 1", ()),))
+    assert f"-- [{name[:12]}]" in result
+    assert "-- [main]" not in result
+
+
+def test_render_sql_dag_multiple_no_deps() -> None:
+    sqls = (
+        ("main", "duckdb", "SELECT * FROM t", ()),
+        ("abcdef1234567890abcdef12", "duckdb", "SELECT 1", ()),
+    )
+    result = _render_sql_dag(sqls)
+    assert "↓" in result
+    assert "-- [main]" in result
+    assert "-- [abcdef123456]" in result
+
+
+def test_render_sql_dag_deps_order_before_main() -> None:
+    """Queries named in main's recorded relations render above main."""
+    r1 = f"ibis_xorq-read_parquet_{'a1' * 16}"
+    r2 = f"ibis_xorq-read_parquet_{'b2' * 16}"
+    sqls = (
+        ("main", "xorq_datafusion", "SELECT * FROM ...", (r1, r2)),
+        (r1, "xorq_datafusion", f'SELECT * FROM "{r1}"', (r1,)),
+        (r2, "xorq_datafusion", f'SELECT * FROM "{r2}"', (r2,)),
+    )
+    result = _render_sql_dag(sqls)
+    main_pos = result.index("-- [main]")
+    assert result.index(f"-- [{_dag_label(r1)}]") < main_pos
+    assert result.index(f"-- [{_dag_label(r2)}]") < main_pos
+
+
+def test_render_sql_dag_ignores_self_and_unknown_relations() -> None:
+    """Relations also list plain source tables (not queries) and, for reads,
+    the read's own name; neither may become an edge. The unknown ref sits on
+    a mid-chain query that something depends on: if the not-a-query guard is
+    dropped, that query is stuck at nonzero in-degree and the cycle fallback
+    emits main first, so this ordering assertion actually fails (a two-node
+    fixture passes with or without the guard)."""
+    r1 = f"ibis_xorq-read_parquet_{'a1' * 16}"
+    rt = f"ibis_rbr-placeholder_{'b2' * 16}"
+    sqls = (
+        ("main", "duckdb", "SELECT * FROM ...", (rt,)),
+        (rt, "duckdb", f'SELECT * FROM "{r1}"', (r1, "batting")),
+        (r1, "duckdb", f'SELECT * FROM "{r1}"', (r1,)),
+    )
+    result = _render_sql_dag(sqls)
+    positions = tuple(
+        result.index(f"-- [{_dag_label(name)}]") for name in (r1, rt, "main")
+    )
+    assert positions == tuple(sorted(positions))
+
+
+def test_dag_label_keeps_hex_ending_user_prefixes_apart() -> None:
+    """The hash match must not eat a user-chosen prefix that happens to end in
+    hex characters; a greedy [a-f0-9]{20,}$ collapsed these two names to the
+    same label. Names with a hash-like suffix that is not the generated
+    32-hex shape stay whole rather than being silently truncated."""
+    a = f"read_deadbeefdeadbeef{'1' * 32}"
+    b = f"read_deadbeefdeadbeef{'2' * 32}"
+    assert _dag_label(a) != _dag_label(b)
+    sha_named = f"events_{'0123456789abcdef' * 2}01234567"  # 40-hex git SHA
+    assert _dag_label(sha_named) == sha_named
+
+
+def test_dag_label_truncates_unsanitized_gen_name_uids() -> None:
+    """Reads that skip hex sanitization (e.g. pinned leaves) keep their raw
+    26-char base32 gen_name uid, which never matches the hex-token pattern;
+    the label truncates it too, so pinned and unpinned siblings render at
+    the same width."""
+    uid = "mfqz3kwbygvhnwuqioxbhmvdgu"
+    assert _dag_label(f"ibis_xorq-read_parquet_{uid}") == (
+        f"ibis_xorq-read_parquet_{uid[:12]}"
+    )
+
+
+def test_render_sql_dag_labels_distinguish_sibling_reads() -> None:
+    """Truncating only the trailing hash keeps sibling reads apart; a flat
+    name[:12] collapsed them all to `ibis_xorq-re`."""
+    r1 = f"ibis_xorq-read_parquet_{'a1' * 16}"
+    r2 = f"ibis_xorq-read_parquet_{'b2' * 16}"
+    sqls = ((r1, "duckdb", "SELECT 1", ()), (r2, "duckdb", "SELECT 2", ()))
+    result = _render_sql_dag(sqls)
+    labels = re.findall(r"-- \[([^\]]+)\]", result)
+    assert len(set(labels)) == 2
+
+
+def test_render_sql_dag_legacy_entries_fall_back_to_sql_scan() -> None:
+    """Entries recorded before relations existed parse with all relations
+    empty; the renderer then falls back to the old quoted-hex SQL scan so a
+    user-named into_backend sub-query still orders above main."""
+    dep_hash = "ab" * 10
+    sqls = (
+        ("main", "duckdb", f'SELECT x FROM "{dep_hash}"', ()),
+        (dep_hash, "duckdb", "SELECT 1 AS x", ()),
+    )
+    result = _render_sql_dag(sqls)
+    assert result.index(dep_hash[:12]) < result.index("-- [main]")
+
+
+def test_render_sql_dag_relation_named_main_is_not_an_edge() -> None:
+    """A source table literally named "main" (e.g. duckdb's default schema)
+    must not read as a dependency on the main query: the resulting cycle
+    would break the ordering."""
+    r1 = f"ibis_xorq-read_parquet_{'a1' * 16}"
+    sqls = (
+        ("main", "duckdb", "SELECT * FROM ...", (r1,)),
+        (r1, "duckdb", "SELECT * FROM main.t", (r1, "main")),
+    )
+    result = _render_sql_dag(sqls)
+    r1_pos = result.index(f"-- [{_dag_label(r1)}]")
+    assert r1_pos < result.index("-- [main]")
+
+
+# ---------------------------------------------------------------------------
+# 16. _pygments_tokens: italic branch (SQL comments)
+# ---------------------------------------------------------------------------
+
+
+def test_pygments_tokens_italic_for_sql_comment():
+    tokens = _pygments_tokens("-- this is a sql comment")
+    all_styles = [s for _, s in tokens]
+    assert any("italic" in s for s in all_styles)
+
+
+# ---------------------------------------------------------------------------
+# 17. CatalogScreen navigation: DataTable focus, cycle_focus, cached status
+# ---------------------------------------------------------------------------
+
+
+def test_tab_cycle_focus_no_crash(catalog):
+    async def _test():
+        app = _make_tui(catalog)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await settle(pilot)
+            await pilot.press("tab")
+            await settle(pilot)
+            await pilot.press("shift+tab")
+            await settle(pilot)
+            assert isinstance(app.screen, CatalogScreen)
+
+    _run(_test())
+
+
+def test_lineage_panel_is_tab_reachable_and_scrollable(catalog: Catalog) -> None:
+    """The lineage tree is multi-line and unbounded in depth: the panel must be in
+    the tab cycle and must scroll like #sql-panel.
+
+    With no entry selected there are no rows, so `j`/`k` fall through to the
+    scroll container rather than moving a row cursor."""
+
+    async def _test():
+        app = _make_tui(catalog)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await settle(pilot)
+            lineage_panel = app.screen.query_one("#lineage-panel")
+            assert isinstance(lineage_panel, VerticalScroll)
+
+            for _ in range(len(CatalogScreen.FOCUS_CYCLE)):
+                if app.focused is lineage_panel:
+                    break
+                await pilot.press("tab")
+                await settle(pilot)
+            assert app.focused is lineage_panel, "tab never reaches the Lineage panel"
+
+            # j/k dispatch to the focused VerticalScroll
+            await pilot.press("j")
+            await settle(pilot)
+            await pilot.press("k")
+            await settle(pilot)
+            assert isinstance(app.screen, CatalogScreen)
+
+    _run(_test())
+
+
+def _lineage_body(screen: CatalogScreen) -> str:
+    """The panel's rendered text, markers and all."""
+    return screen.query_one("#lineage-content", Static).render().plain
+
+
+def _cursor_row(screen: CatalogScreen) -> LineageRow | None:
+    """The lineage row the fold keys currently act on."""
+    return screen._lineage_cursor_row()
+
+
+async def _move_cursor_to(pilot: Pilot, node_id: str) -> None:
+    """Walk the lineage cursor down onto *node_id*'s row."""
+    screen = pilot.app.screen
+    for _ in range(len(screen._lineage_rows) + 1):
+        row = _cursor_row(screen)
+        if row is not None and row.node_id == node_id:
+            return
+        await pilot.press("j")
+        await settle(pilot)
+    raise AssertionError(f"the lineage cursor never reached {node_id}")
+
+
+async def _focus_lineage_panel(pilot: Pilot) -> None:
+    """Tab until the lineage panel owns focus, so the fold keys are live."""
+    panel = pilot.app.screen.query_one("#lineage-panel")
+    for _ in range(len(CatalogScreen.FOCUS_CYCLE)):
+        if pilot.app.focused is panel:
+            return
+        await pilot.press("tab")
+        await settle(pilot)
+    raise AssertionError("tab never reaches the Lineage panel")
+
+
+async def _await_lineage_rows(pilot: Pilot) -> None:
+    """Wait out the panel's render debounce, which `settle` does not cover."""
+    screen = pilot.app.screen
+    for _ in range(40):
+        await settle(pilot)
+        if screen._lineage_rows:
+            return
+        await pilot.pause()
+    raise AssertionError("the lineage panel never rendered any rows")
+
+
+async def _move_off_entry(pilot: Pilot) -> str:
+    """Move the entries-tree cursor off its current line; return the key pressed.
+
+    Which direction is available depends on where the entry sits in the tree, and
+    a step can land on a kind branch as well as another entry -- so this watches
+    the tree's own cursor rather than the selected row.
+    """
+    tree = pilot.app.screen.query_one("#catalog-tree", Tree)
+    start = tree.cursor_line
+    for key in ("j", "k"):
+        await pilot.press(key)
+        await settle(pilot)
+        if tree.cursor_line != start:
+            return key
+    raise AssertionError("the entries-tree cursor never moved")
+
+
+async def _select_lineage_entry(
+    pilot: Pilot, catalog: Catalog, *entries: CatalogEntry
+) -> CatalogScreen:
+    """Populate the tree and land on *entries[0]*'s leaf, rows rendered.
+
+    Leaves are grouped by kind and ordered by hash, not by insertion, so the
+    cursor is walked to the wanted entry rather than assumed to start on it.
+    """
+    screen = pilot.app.screen
+    rows = tuple(CatalogRowData(entry=entry) for entry in entries)
+    screen._row_cache = {row.row_key: row for row in rows}
+    screen._render_refresh(catalog.repo.working_dir, rows)
+    await settle(pilot)
+    wanted = rows[0].row_key
+    for _ in range(2 * len(rows) + 2):
+        await pilot.press("j")
+        await settle(pilot)
+        selected = screen._selected_row_data()
+        if selected is not None and selected.row_key == wanted:
+            await _await_lineage_rows(pilot)
+            return screen
+    raise AssertionError(f"never reached the leaf for {wanted}")
+
+
+def test_lineage_bracket_keys_expand_and_fold_the_cursor_node(
+    catalog: Catalog, entry_columns: CatalogEntry
+) -> None:
+    """`]` lists the columns of the node under the cursor and `[` folds them back,
+    the same thing `xorq catalog lineage --expand` prints."""
+
+    async def _test():
+        app = _make_tui(catalog)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await settle(pilot)
+            screen = await _select_lineage_entry(pilot, catalog, entry_columns)
+            await _focus_lineage_panel(pilot)
+
+            row_data = screen._selected_row_data()
+            key = row_data.row_key
+            compact_rows = screen._lineage_rows
+            target = compact_rows[0]
+            assert target.node_id in row_data.lineage_expandable
+            assert EXPANDABLE_MARKER in _lineage_body(screen)
+
+            await _move_cursor_to(pilot, target.node_id)
+            await pilot.press("]")
+            await settle(pilot)
+
+            assert screen._lineage_expanded[key] == frozenset({target.node_id})
+            columns = [r for r in screen._lineage_rows if r.kind == COLUMN_KIND]
+            schema = row_data.entry.metadata.lineage.by_id[target.node_id]["schema"]
+            assert len(columns) == len(schema)
+            body = _lineage_body(screen)
+            for column in schema:
+                assert column in body
+            assert EXPANDED_MARKER in body
+            # the cursor stayed on the node it expanded
+            assert _cursor_row(screen).node_id == target.node_id
+
+            await pilot.press("[")
+            await settle(pilot)
+
+            assert screen._lineage_expanded[key] == frozenset()
+            assert screen._lineage_rows == compact_rows
+            assert EXPANDED_MARKER not in _lineage_body(screen)
+
+    _run(_test())
+
+
+def test_lineage_fold_keys_belong_to_the_panel_alone(
+    catalog: Catalog, entry_columns: CatalogEntry
+) -> None:
+    """`h`/`l` keep folding the entries tree, and the bracket keys are offered
+    only while the Lineage panel has focus."""
+
+    async def _test():
+        app = _make_tui(catalog)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await settle(pilot)
+            screen = await _select_lineage_entry(pilot, catalog, entry_columns)
+            key = screen._selected_row_data().row_key
+
+            # entries tree focused: the fold bindings are hidden and inert
+            assert screen.check_action("lineage_expand", ()) is None
+            await pilot.press("]")
+            await settle(pilot)
+            assert screen._lineage_expanded.get(key, frozenset()) == frozenset()
+
+            await _focus_lineage_panel(pilot)
+            assert screen.check_action("lineage_expand", ()) is True
+
+            # `l` here is the tree's key, not the panel's: it folds nothing
+            await pilot.press("l")
+            await settle(pilot)
+            assert screen._lineage_expanded.get(key, frozenset()) == frozenset()
+
+            await pilot.press("]")
+            await settle(pilot)
+            assert screen._lineage_expanded[key]
+
+    _run(_test())
+
+
+def test_lineage_fold_on_a_column_row_folds_the_node_it_came_from(
+    catalog: Catalog, entry_columns: CatalogEntry
+) -> None:
+    """A column row belongs to the node above it, so `[` there folds that node --
+    the alternative is a cursor sitting on a row no key can act on."""
+
+    async def _test():
+        app = _make_tui(catalog)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await settle(pilot)
+            screen = await _select_lineage_entry(pilot, catalog, entry_columns)
+            await _focus_lineage_panel(pilot)
+
+            key = screen._selected_row_data().row_key
+            target = screen._lineage_rows[0]
+            await _move_cursor_to(pilot, target.node_id)
+            await pilot.press("]")
+            await settle(pilot)
+
+            # step onto the first column row, which carries the same node id
+            await pilot.press("j")
+            await settle(pilot)
+            assert _cursor_row(screen).kind == COLUMN_KIND
+
+            await pilot.press("[")
+            await settle(pilot)
+
+            assert screen._lineage_expanded[key] == frozenset()
+            assert not [r for r in screen._lineage_rows if r.kind == COLUMN_KIND]
+
+    _run(_test())
+
+
+def test_lineage_expansion_is_kept_per_entry(
+    catalog: Catalog, entry_columns: CatalogEntry, entry_a: CatalogEntry
+) -> None:
+    """Fold state is keyed by entry, so browsing to a neighbour and back keeps
+    what you expanded."""
+
+    async def _test():
+        app = _make_tui(catalog)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await settle(pilot)
+            screen = await _select_lineage_entry(pilot, catalog, entry_columns, entry_a)
+            await _focus_lineage_panel(pilot)
+
+            key = screen._selected_row_data().row_key
+            target = screen._lineage_rows[0]
+            await _move_cursor_to(pilot, target.node_id)
+            await pilot.press("]")
+            await settle(pilot)
+            expanded_rows = len(screen._lineage_rows)
+            assert screen._lineage_expanded[key]
+
+            # to the other entry and back: the fold keys are the panel's, so the
+            # entries tree has to take focus before j/k move the selection
+            await pilot.press("shift+tab")
+            await settle(pilot)
+            away = await _move_off_entry(pilot)
+            selected = screen._selected_row_data()
+            assert selected is None or selected.row_key != key
+
+            await pilot.press("k" if away == "j" else "j")
+            await _await_lineage_rows(pilot)
+
+            assert screen._selected_row_data().row_key == key
+            assert screen._lineage_expanded[key] == frozenset({target.node_id})
+            assert len(screen._lineage_rows) == expanded_rows
+
+    _run(_test())
+
+
+def test_lineage_cursor_walks_every_row_and_scrolls_to_follow(
+    catalog: Catalog, entry_wide: CatalogEntry
+) -> None:
+    """`j` advances one row at a time, scrolling to keep the cursor visible.
+
+    The cursor is a row index and not a node id because a node owns more than one
+    row once expanded -- its columns carry its id too, so an id-keyed cursor would
+    snap back to the node's own row.
+    """
+
+    async def _test():
+        app = _make_tui(catalog)
+        # a terminal too short for the expanded tree, so the panel has to scroll
+        async with app.run_test(size=(100, 24)) as pilot:
+            await settle(pilot)
+            screen = await _select_lineage_entry(pilot, catalog, entry_wide)
+            await _focus_lineage_panel(pilot)
+
+            key = screen._selected_row_data().row_key
+            target = screen._lineage_rows[0]
+            await _move_cursor_to(pilot, target.node_id)
+            await pilot.press("]")
+            await settle(pilot)
+
+            panel = screen.query_one("#lineage-panel", VerticalScroll)
+            rows = screen._lineage_rows
+            assert len(rows) > panel.content_size.height, "tree fits: nothing to scroll"
+            # the node and its columns share an id, which is what breaks an
+            # id-keyed cursor
+            assert len({r.node_id for r in rows}) < len(rows)
+
+            seen = [screen._lineage_cursor[key]]
+            for _ in range(len(rows)):
+                await pilot.press("j")
+                await settle(pilot)
+                seen.append(screen._lineage_cursor[key])
+
+            assert seen[-1] == len(rows) - 1, "the cursor never reached the last row"
+            assert all(b - a in (0, 1) for a, b in zip(seen, seen[1:])), seen
+            assert panel.scroll_offset.y > 0, "the panel never scrolled to follow"
+
+    _run(_test())
+
+
+def test_lineage_expand_on_a_column_row_does_nothing(
+    catalog: Catalog, entry_columns: CatalogEntry
+) -> None:
+    """A column row's node is already expanded, so `]` there is a silent no-op --
+    and the row carries no marker, which is the whole message.
+
+    (Every row a compact tree draws is a boundary or the root, and those all store
+    a schema, so this is the only unexpandable row the panel can show.)
+    """
+
+    async def _test():
+        app = _make_tui(catalog)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await settle(pilot)
+            screen = await _select_lineage_entry(pilot, catalog, entry_columns)
+            await _focus_lineage_panel(pilot)
+
+            key = screen._selected_row_data().row_key
+            target = screen._lineage_rows[0]
+            await _move_cursor_to(pilot, target.node_id)
+            await pilot.press("]")
+            await settle(pilot)
+            expanded = screen._lineage_expanded[key]
+
+            await pilot.press("j")
+            await settle(pilot)
+            column_row = _cursor_row(screen)
+            assert column_row.kind == COLUMN_KIND
+            rows_before = screen._lineage_rows
+
+            await pilot.press("]")
+            await settle(pilot)
+
+            assert screen._lineage_expanded[key] == expanded
+            assert screen._lineage_rows == rows_before
+            # the column row itself is not offered as expandable
+            body_line = _lineage_body(screen).splitlines()[
+                LINEAGE_TREE_OFFSET + rows_before.index(column_row)
+            ]
+            assert EXPANDABLE_MARKER not in body_line
+
+    _run(_test())
+
+
+def test_h_l_with_datatable_focused(catalog: Catalog) -> None:
+    async def _test():
+        app = _make_tui(catalog)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await settle(pilot)
+            schema_table = app.screen.query_one("#schema-preview-table")
+            schema_table.focus()
+            await settle(pilot)
+            await pilot.press("h")
+            await settle(pilot)
+            await pilot.press("l")
+            await settle(pilot)
+            assert isinstance(app.screen, CatalogScreen)
+
+    _run(_test())
+
+
+def test_j_k_with_datatable_focused(catalog):
+    async def _test():
+        app = _make_tui(catalog)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await settle(pilot)
+            schema_table = app.screen.query_one("#schema-preview-table")
+            schema_table.focus()
+            await settle(pilot)
+            await pilot.press("j")
+            await settle(pilot)
+            await pilot.press("k")
+            await settle(pilot)
+            assert isinstance(app.screen, CatalogScreen)
+
+    _run(_test())
+
+
+def test_render_status_includes_cached_count(catalog, entry_cached):
+    async def _test():
+        app = _make_tui(catalog)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await settle(pilot)
+            screen = app.screen
+            entry_cached.expr.execute()
+            row = CatalogRowData(entry=entry_cached)
+            screen._row_cache = {row.row_key: row}
+            screen._render_status("09:00:00", catalog.repo.working_dir)
+            await settle(pilot)
+            status_text = str(screen.query_one("#status-bar", Static).content)
+            assert "cached" in status_text
+
+    _run(_test())
+
+
+def test_tree_expand_collapses_then_enters_first_child(catalog, entry_a, entry_b):
+    async def _test():
+        app = _make_tui(catalog)
+        async with app.run_test(size=(120, 40)) as pilot:
+            screen, _ = await _populate_tree(pilot, catalog, entry_a, entry_b)
+            tree = screen.query_one("#catalog-tree")
+
+            await run_script(
+                pilot,
+                # cursor on branch (source), press l to expand (already expanded) → enter first child
+                Assert(lambda p: tree.cursor_node.data == "source"),
+                Press(("l",)),
+                Assert(lambda p: tree.cursor_node.data == entry_a.name),
+                # press h on leaf → select parent branch, collapse it
+                Press(("h",)),
+                Assert(lambda p: tree.cursor_node.data == "source"),
+            )
+
+    _run(_test())
+
+
+# ---------------------------------------------------------------------------
+# 18. DataViewScreen: actions (sort, drop, undo, redo, navigate, persist)
+# ---------------------------------------------------------------------------
+
+
+def test_data_view_sort_asc_pushes_step(catalog, entry_a, _mock_catalog_run):
+    async def _test():
+        app = _make_tui(catalog)
+        async with app.run_test(size=(120, 40)) as pilot:
+            screen, _ = await _populate_tree(pilot, catalog, entry_a)
+            await run_script(pilot, Press(("j",)), Press(("e",)))
+            await settle(pilot)
+            data_screen = app.screen
+            assert isinstance(data_screen, DataViewScreen)
+            data_table = data_screen.query_one("#data-view-table", DataTable)
+            await wait_until(pilot, lambda: data_table.row_count > 0)
+
+            await pilot.press("]")
+            await settle(pilot)
+            assert data_screen._stack.cursor == 1
+            assert data_screen._stack.steps[0].verb == "order_by"
+            assert "desc" not in data_screen._stack.steps[0].code
+
+    _run(_test())
+
+
+def test_data_view_sort_desc_pushes_step(catalog, entry_a, _mock_catalog_run):
+    async def _test():
+        app = _make_tui(catalog)
+        async with app.run_test(size=(120, 40)) as pilot:
+            screen, _ = await _populate_tree(pilot, catalog, entry_a)
+            await run_script(pilot, Press(("j",)), Press(("e",)))
+            await settle(pilot)
+            data_screen = app.screen
+            assert isinstance(data_screen, DataViewScreen)
+            data_table = data_screen.query_one("#data-view-table", DataTable)
+            await wait_until(pilot, lambda: data_table.row_count > 0)
+
+            await pilot.press("[")
+            await settle(pilot)
+            assert data_screen._stack.cursor == 1
+            assert data_screen._stack.steps[0].verb == "order_by"
+            assert "desc" in data_screen._stack.steps[0].code
+
+    _run(_test())
+
+
+def test_data_view_drop_column_pushes_step(catalog, entry_a, _mock_catalog_run):
+    async def _test():
+        app = _make_tui(catalog)
+        async with app.run_test(size=(120, 40)) as pilot:
+            screen, _ = await _populate_tree(pilot, catalog, entry_a)
+            await run_script(pilot, Press(("j",)), Press(("e",)))
+            await settle(pilot)
+            data_screen = app.screen
+            assert isinstance(data_screen, DataViewScreen)
+            data_table = data_screen.query_one("#data-view-table", DataTable)
+            await wait_until(pilot, lambda: data_table.row_count > 0)
+
+            await pilot.press("d")
+            await settle(pilot)
+            assert data_screen._stack.cursor == 1
+            assert data_screen._stack.steps[0].verb == "drop"
+
+    _run(_test())
+
+
+def test_data_view_undo_after_step(catalog, entry_a, _mock_catalog_run):
+    async def _test():
+        app = _make_tui(catalog)
+        async with app.run_test(size=(120, 40)) as pilot:
+            screen, _ = await _populate_tree(pilot, catalog, entry_a)
+            await run_script(pilot, Press(("j",)), Press(("e",)))
+            await settle(pilot)
+            data_screen = app.screen
+            data_table = data_screen.query_one("#data-view-table", DataTable)
+            await wait_until(pilot, lambda: data_table.row_count > 0)
+
+            await pilot.press("]")
+            await settle(pilot)
+            assert data_screen._stack.cursor == 1
+
+            await pilot.press("u")
+            await settle(pilot)
+            assert data_screen._stack.cursor == 0
+            assert data_screen._stack.can_redo
+
+    _run(_test())
+
+
+def test_data_view_redo_after_undo(catalog, entry_a, _mock_catalog_run):
+    async def _test():
+        app = _make_tui(catalog)
+        async with app.run_test(size=(120, 40)) as pilot:
+            screen, _ = await _populate_tree(pilot, catalog, entry_a)
+            await run_script(pilot, Press(("j",)), Press(("e",)))
+            await settle(pilot)
+            data_screen = app.screen
+            data_table = data_screen.query_one("#data-view-table", DataTable)
+            await wait_until(pilot, lambda: data_table.row_count > 0)
+
+            await pilot.press("]")
+            await settle(pilot)
+            await pilot.press("u")
+            await settle(pilot)
+            assert data_screen._stack.cursor == 0
+
+            await pilot.press("ctrl+r")
+            await settle(pilot)
+            assert data_screen._stack.cursor == 1
+
+    _run(_test())
+
+
+def test_data_view_navigation_keys_no_crash(catalog, entry_a, _mock_catalog_run):
+    async def _test():
+        app = _make_tui(catalog)
+        async with app.run_test(size=(120, 40)) as pilot:
+            screen, _ = await _populate_tree(pilot, catalog, entry_a)
+            await run_script(pilot, Press(("j",)), Press(("e",)))
+            await settle(pilot)
+            data_screen = app.screen
+            data_table = data_screen.query_one("#data-view-table", DataTable)
+            await wait_until(pilot, lambda: data_table.row_count > 0)
+
+            for key in ("j", "k", "h", "l"):
+                await pilot.press(key)
+                await settle(pilot)
+            assert isinstance(app.screen, DataViewScreen)
+
+    _run(_test())
+
+
+def test_data_view_scroll_top_and_bottom(catalog, entry_a, _mock_catalog_run):
+    async def _test():
+        app = _make_tui(catalog)
+        async with app.run_test(size=(120, 40)) as pilot:
+            screen, _ = await _populate_tree(pilot, catalog, entry_a)
+            await run_script(pilot, Press(("j",)), Press(("e",)))
+            await settle(pilot)
+            data_screen = app.screen
+            data_table = data_screen.query_one("#data-view-table", DataTable)
+            await wait_until(pilot, lambda: data_table.row_count > 0)
+
+            await pilot.press("g")
+            await settle(pilot)
+            assert data_table.cursor_row == 0
+
+            await pilot.press("shift+g")
+            await settle(pilot)
+            assert data_table.cursor_row == data_table.row_count - 1
+
+    _run(_test())
+
+
+def test_data_view_stack_browser_shows_step_content(
+    catalog, entry_a, _mock_catalog_run
+):
+    async def _test():
+        app = _make_tui(catalog)
+        async with app.run_test(size=(120, 40)) as pilot:
+            screen, _ = await _populate_tree(pilot, catalog, entry_a)
+            await run_script(pilot, Press(("j",)), Press(("e",)))
+            await settle(pilot)
+            data_screen = app.screen
+            data_table = data_screen.query_one("#data-view-table", DataTable)
+            await wait_until(pilot, lambda: data_table.row_count > 0)
+
+            await pilot.press("]")
+            await settle(pilot)
+
+            await pilot.press("s")
+            await settle(pilot)
+            panel = data_screen.query_one("#stack-browser-panel")
+            assert panel.display is True
+            content_widget = data_screen.query_one("#stack-browser-content", Static)
+            assert "order_by" in str(content_widget.content)
+
+    _run(_test())
+
+
+def test_data_view_freeform_submit_pushes_step(catalog, entry_a, _mock_catalog_run):
+    async def _test():
+        app = _make_tui(catalog)
+        async with app.run_test(size=(120, 40)) as pilot:
+            screen, _ = await _populate_tree(pilot, catalog, entry_a)
+            await run_script(pilot, Press(("j",)), Press(("e",)))
+            await settle(pilot)
+            data_screen = app.screen
+            data_table = data_screen.query_one("#data-view-table", DataTable)
+            await wait_until(pilot, lambda: data_table.row_count > 0)
+
+            await pilot.press(":")
+            await settle(pilot)
+            cmd = data_screen.query_one("#command-input")
+            cmd.value = 'source.select("id")'
+            await pilot.press("enter")
+            await settle(pilot)
+
+            assert data_screen._stack.cursor == 1
+            assert data_screen._stack.steps[0].verb == "freeform"
+
+    _run(_test())
+
+
+def test_data_view_persist_prompt_shows_after_step(catalog, entry_a, _mock_catalog_run):
+    async def _test():
+        app = _make_tui(catalog)
+        async with app.run_test(size=(120, 40)) as pilot:
+            screen, _ = await _populate_tree(pilot, catalog, entry_a)
+            await run_script(pilot, Press(("j",)), Press(("e",)))
+            await settle(pilot)
+            data_screen = app.screen
+            data_table = data_screen.query_one("#data-view-table", DataTable)
+            await wait_until(pilot, lambda: data_table.row_count > 0)
+
+            await pilot.press("]")
+            await settle(pilot)
+            assert data_screen._stack.cursor == 1
+
+            await pilot.press("w")
+            await settle(pilot)
+            cmd = data_screen.query_one("#command-input")
+            assert cmd.display is True
+            assert "save" in str(cmd.border_title).lower()
+
+    _run(_test())
+
+
+def test_data_view_load_error_shows_in_status(
+    catalog, entry_a, _mock_catalog_run_error
+):
+    async def _test():
+        app = _make_tui(catalog)
+        async with app.run_test(size=(120, 40)) as pilot:
+            screen, _ = await _populate_tree(pilot, catalog, entry_a)
+            await run_script(pilot, Press(("j",)), Press(("e",)))
+            await settle(pilot)
+            data_screen = app.screen
+            assert isinstance(data_screen, DataViewScreen)
+            status = data_screen.query_one("#data-view-status", Static)
+            await wait_until(pilot, lambda: "Error" in str(status.content))
+
+    _run(_test())

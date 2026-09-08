@@ -1,0 +1,440 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+sources = ["python"]
+# Exclude env_templates from the normal VCS scan (git ls-files picks them up in
+# a git repo, but force-include below also adds them, causing duplicates in the
+# wheel ZIP).  By excluding here we ensure only force-include writes the files.
+exclude = [
+    "python/xorq/env_templates/**",
+]
+
+# .gitignore contains `.env.*` which hatchling treats as an exclusion pattern
+# in non-VCS contexts (sdist rebuilds, staging dirs, uv tool run).
+# force-include overrides this so env_templates/ is always in the wheel.
+[tool.hatch.build.targets.wheel.force-include]
+"python/xorq/env_templates" = "xorq/env_templates"
+
+[tool.hatch.build.targets.sdist]
+only-include = ["python"]
+
+[tool.hatch.build.targets.sdist.force-include]
+"uv.lock" = "uv.lock"
+
+[project]
+name = "xorq"
+version = "0.4.1"
+dependencies = [
+    "attrs>=24.1.0; python_version >= '3.10' and python_version < '4.0'",
+    "pyarrow>=18.0.0,<22; python_version >= '3.10' and python_version < '4.0'",
+    "structlog>=24.2.0,<26; python_version >= '3.10' and python_version < '4.0'",
+    "pandas>=2.2.3,<3 ; python_version >= '3.10' and python_version < '4.0'",
+    "atpublic>=5.1",
+    "parsy>=2",
+    "packaging>=22",
+    # Per-interpreter floors so `--resolution lowest-direct` gets a wheel and not
+    # a source build.  Each is the first release with wheels for that Python,
+    # except numpy on 3.10, where 1.22.4 is pandas' own floor (1.21.3 was the
+    # first with cp310 wheels).  The `>= '3.13'` rows are open upward and only
+    # safe while requires-python caps at <3.14; raising that cap needs a new row
+    # per interpreter, or lowest-direct picks a release with no wheel for it.
+    "numpy>=1.22.4; python_version < '3.11'",
+    "numpy>=1.23.2; python_version == '3.11'",
+    "numpy>=1.26.0; python_version == '3.12'",
+    "numpy>=2.1.0; python_version >= '3.13'",
+    "xxhash>=3.0; python_version < '3.11'",
+    "xxhash>=3.2; python_version == '3.11'",
+    "xxhash>=3.4; python_version == '3.12'",
+    "xxhash>=3.5; python_version >= '3.13'",
+    "pygments>=2.13",
+    "python-dateutil>=2.8.2",
+    "pytz>=2022.7",
+    "sqlglot>=23.4,!=26.32.0,<28.7.0",
+    "tomlkit>=0.12",
+    "toolz>=0.11",
+    "typing-extensions>=4.3.0",
+    "py-yaml12",
+    "cloudpickle>=3.1.1",
+    "xorq-datafusion==0.2.10",
+    "opentelemetry-sdk>=1.32.1",
+    "opentelemetry-exporter-otlp>=1.32.1",
+    "opentelemetry-exporter-otlp-proto-grpc>=1.32.1",
+    "opentelemetry-exporter-prometheus>=0.55b1",
+    "prometheus-client>=0.22.1",
+    "cryptography>=45.0.3",
+    "strenum>=0.4.15 ; python_version <= '3.10'",
+    "uv>=0.7.20",
+    "rich>=13.9.4",
+    "click>=8.0",
+    "gitpython>=3.1.46",
+    "textual>=1.0.0",
+    "filelock>=3.13",
+    "xorq-dasher>=0.1.1",
+    "batchcorder==0.1.3",
+]
+requires-python = ">=3.10,<3.14"
+authors = [
+    { name = "Hussain Sultan", email = "hussain@xorq.dev" },
+]
+maintainers = [
+    { name = "Dan Lovell", email = "dan@xorq.dev" },
+    { name = "Daniel Mesejo", email = "mesejo@xorq.dev" },
+]
+description = "Executable memory for tabular data: portable, multi-engine pipelines with caching, lineage, and a git-backed catalog agents and humans can reuse."
+readme = "README.md"
+keywords = ["ibis", "datafusion", "arrow", "duckdb", "sql", "multi-engine", "data-pipelines", "lineage", "caching", "catalog", "machine-learning"]
+license = { file = "LICENSE" }
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Topic :: Database :: Database Engines/Servers",
+    "Topic :: Scientific/Engineering",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: Implementation :: CPython"
+]
+
+[project.urls]
+Homepage = "https://www.xorq.dev/"
+Repository = "https://github.com/xorq-labs/xorq/"
+Issues = "https://github.com/xorq-labs/xorq/issues"
+Changelog = "https://github.com/xorq-labs/xorq/blob/main/CHANGELOG.md"
+Documentation = "https://docs.xorq.dev/"
+Blog = "https://xorq.dev/blog/"
+
+[project.optional-dependencies]
+pyiceberg = [
+    "pyiceberg[sql-sqlite,sql-postgres]>=0.9.0",
+]
+duckdb = [
+    "duckdb>=1.5",  # 1.5 required for stable Arrow stream registration used by StreamCache
+]
+datafusion = [
+    "datafusion>=47.0.0,<49; python_version >= '3.10' and python_version < '4.0'"
+]
+snowflake = [
+    "adbc-driver-snowflake>=1.5.0",
+    "snowflake-connector-python>=3.10.1,<4 ; python_version >= '3.10' and python_version < '4.0'",
+]
+examples = [
+    "pins[gcs]>=0.8.3,<1 ; python_version >= '3.10' and python_version < '4.0'",
+    "xgboost >=1.6.1 ; python_version >= '3.10' and python_version < '4.0'",
+    "duckdb >=0.10.3,<2 ; python_version >= '3.10' and python_version < '4.0'",
+    "matplotlib>=3.8.0; python_version < '3.13'",
+    "matplotlib>=3.9.2; python_version >= '3.13'",  # 3.9.2 is first matplotlib with cp313 wheels
+    "scikit-learn<2.0.0,>=1.5.0; python_version < '3.13'",
+    "scikit-learn<2.0.0,>=1.5.2; python_version >= '3.13'",  # 1.5.2 is first sklearn with cp313 wheels
+    "openai>=1.65.4",
+    "adbc-driver-postgresql>=1.4.0",
+    "adbc-driver-sqlite>=1.4.0",
+    "pyiceberg[sql-sqlite,sql-postgres]>=0.9.0",
+    "mcp>=1.5.0",
+    "requests>=2.32.3",
+    "xorq-feature-utils",
+    "xorq-weather-lib",
+]
+postgres = [
+    "adbc-driver-postgresql>=1.4.0",
+    "psycopg[binary]>=3.2.0; python_version < '3.13'",
+    "psycopg[binary]>=3.2.2; python_version >= '3.13'",  # 3.2.2 is first psycopg-binary with cp313 wheels
+]
+sqlite = [
+    "adbc-driver-sqlite>=1.4.0",
+]
+gizmosql = [
+    "adbc-driver-gizmosql>=1.1.5",
+    "duckdb>=1.5",  # see duckdb extra above
+    "gizmosql>=1.26.0,<2",
+    "cryptography>=42",
+]
+ibis = [
+    "ibis-framework>=10.5.0",
+]
+geospatial = [
+    "geoarrow-types>=0.2,<1",
+]
+trino = [
+    "trino==0.336.0",
+]
+bigquery = [
+    # >=1.8: manifest-based driver resolution for dbapi.connect(driver="bigquery")
+    # (the driver is installed out-of-band via `dbc install bigquery`)
+    "adbc-driver-manager>=1.8.0",
+    "db-dtypes>=0.3,<2",
+    "google-cloud-bigquery>=3,<4",
+    "google-cloud-bigquery-storage>=2,<3",
+    "pydata-google-auth>=1.4.0,<2",
+]
+bsl = [
+    "boring-semantic-layer>=0.3.13",
+]
+databricks = [
+    "databricks-sql-connector>=3.0.0",
+    "adbc-driver-manager>=1.0.0",
+]
+annex = [
+    "git-annex>=10.20250220",
+]
+
+[dependency-groups]
+dev = [
+    "black==26.3.1",
+    "blackdoc==0.4.6",
+    "codespell[hard-encoding-detection,toml]==2.4.2",
+    "git-cliff<3.0.0,>=2.2.1",
+    "ipython<9.11.0,>=8.19.0",
+    "pre-commit==4.6.0",
+    "ruff==0.15.12",
+    "trino==0.336.0",
+    "pip>=24.3.1",
+    "vendoring>=1.2.0",
+    "xorq-style~=0.3.0",
+    "pyopenssl>=24.3.0",
+    "duckdb>=1.5",  # see duckdb extra above
+    "adbc-driver-sqlite>=1.4.0",
+    "scikit-learn<2.0.0,>=1.5.0; python_version < '3.13'",
+    "scikit-learn<2.0.0,>=1.5.2; python_version >= '3.13'",  # 1.5.2 is first sklearn with cp313 wheels
+    "xgboost>=1.6.1",
+    "matplotlib>=3.8.0; python_version < '3.13'",
+    "matplotlib>=3.9.2; python_version >= '3.13'",  # 3.9.2 is first matplotlib with cp313 wheels
+]
+test = [
+    "pytest-benchmark>=5.1.0",
+    "pytest==9.0.3",
+    "pytest-cov==6.3.0",
+    "pytest-mock>=3.14.0,<4",
+    "pytest-snapshot<1.0.0,>=0.9.0",
+    "coverage[toml]==7.13.4",
+    "pytest-xdist>=3.8.0",
+]
+docs = [
+    "quartodoc<0.11.2,>=0.7.2",
+    "griffe<2.0",
+    "nbformat<6.0.0,>=5.10.4",
+    "nbclient<1.0.0,>=0.10.0",
+    "ipykernel<7.3.0,>=6.29.4",
+    "notebook>=7.3.2",
+    "ibis-framework>=10.5.0",
+    "pymarkdownlnt>=0.9.37",
+    "python-frontmatter>=1.1.0",
+    "sybil>=6",
+]
+
+[project.entry-points."xorq.backends"]
+xorq_datafusion = "xorq.backends.xorq_datafusion"
+postgres = "xorq.backends.postgres"
+snowflake = "xorq.backends.snowflake"
+datafusion = "xorq.backends.datafusion"
+duckdb = "xorq.backends.duckdb"
+pandas = "xorq.backends.pandas"
+trino = "xorq.backends.trino"
+pyiceberg = "xorq.backends.pyiceberg"
+sqlite = "xorq.backends.sqlite"
+gizmosql = "xorq.backends.gizmosql"
+databricks = "xorq.backends.databricks"
+bigquery = "xorq.backends.bigquery"
+
+[project.scripts]
+xorq = "xorq.cli:main"
+
+[tool.vendoring]
+destination = "python/xorq/vendor/"
+requirements = "vendors.txt"
+namespace = "xorq.vendor"
+
+protected-files = ["__init__.py", "README.md", "vendors.txt"]
+patches-dir = "tasks/patches"
+
+[tool.vendoring.transformations]
+substitute = [
+    {match = '__import__("ibis")', replace = '__import__("xorq.vendor.ibis")'}
+]
+drop = [
+    "bin/",
+    "*.so",
+    "typing.*",
+    "*/tests/"
+]
+
+[tool.ruff.lint]
+extend-select = [
+    "I",      # isort
+    "ICN",    # import conventions
+    "B",      # flake8-bugbear: mutable default args, exception chaining, etc.
+    "C4",     # flake8-comprehensions: unnecessary list/dict/set comprehensions
+    "FURB",   # refurb: modernize Python code
+    "PLC0415",  # import-outside-toplevel: imports must be at module level
+    "DTZ",      # flake8-datetimez: enforce timezone-aware datetime usage
+    # TODO: add PLW1514 (unspecified-encoding) when it graduates from ruff preview
+]
+ignore = [
+    "B018",  # useless-expression: side-effect property access is intentional
+    "B905",  # zip-without-explicit-strict: not enforced project-wide
+    # TODO: fix existing DTZ violations and remove these ignores
+    "DTZ001",   # call-datetime-without-tzinfo (22 existing violations)
+    "DTZ002",   # call-datetime-today (1 existing violation)
+    "DTZ005",   # call-datetime-now-without-tzinfo (10 existing violations)
+    "DTZ006",   # call-datetime-fromtimestamp (3 existing violations)
+    "DTZ011",   # call-date-today (4 existing violations)
+]
+
+[tool.ruff.lint.per-file-ignores]
+"python/xorq/__init__.py" = ["I001"]
+"python/xorq/api.py" = ["I001"]
+"python/xorq/vendor/**" = ["B", "PLC0415"]
+# Tutorial snippets are extracted block-by-block from .qmd files, so
+# imports appear next to the block that introduces them.
+"docs/tutorials/**/*.snippets.py" = ["E402", "I001"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["xorq"]
+section-order = ["future", "standard-library", "third-party", "first-party", "local-folder"]
+lines-after-imports = 2
+
+[tool.xorq-style.print]
+# Example scripts print receipts to stdout by design. allow-files matches on
+# basename only (no globs), so list each example explicitly as it's touched.
+allow-files = [
+    "wap_audit_iceberg.py",
+    "wap_audit_parquet.py",
+]
+
+[tool.codespell]
+skip = "*.lock,.direnv,.git,docs/_freeze/**/html.json"
+ignore-regex = '\b(DOUB|i[if]f|I[IF]F|lamduh|AFE|crate|ba|fpr)\b'
+builtin = "clear,rare,names"
+
+[tool.pytest.ini_options]
+faulthandler_timeout = 300
+filterwarnings = [
+    # pandas 2.2 warnings
+    'ignore:DataFrameGroupBy\.apply operated on the grouping columns\. This behavior is deprecated:DeprecationWarning',
+    'ignore:Downcasting object dtype arrays on \.fillna, \.ffill, \.bfill is deprecated:FutureWarning',
+    # pandas 2.2 warnings coming directly from the way flink uses pandas
+    "ignore:Passing a BlockManager to DataFrame is deprecated:DeprecationWarning",
+    "ignore:.+ /workspace/src/objective/regression_obj.cu:UserWarning"
+]
+markers = [
+    "snowflake",
+    "library",
+    "s3",
+    "gcs",
+    "snapshot_check",
+    "slow",
+    "datafusion: Apache Datafusion tests",
+    "duckdb: DuckDB tests",
+
+    "pandas",
+    "postgres",
+    "trino",
+    "pyiceberg",
+    "core",
+    "sqlite",
+    "gizmosql: GizmoSQL (DuckDB over Arrow Flight SQL) tests",
+    "databricks: Databricks tests",
+    "xorq_datafusion: xorq DataFusion backend tests",
+    "uv_export: tests that call uv export against the project lockfile",
+    "bare_install: tests that build the wheel and drive the CLI against declared dependencies only",
+    "bigquery: BigQuery tests",
+]
+consider_namespace_packages = true
+addopts = "--pdbcls=IPython.terminal.debugger:TerminalPdb"
+
+[tool.coverage.run]
+source = ["python/xorq"]
+omit = [
+    "*/tests/*",
+    "*/vendor/*",
+]
+parallel = true
+concurrency = ["multiprocessing", "thread"]
+sigterm = true
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = false
+
+[tool.git-cliff.changelog]
+header = """
+# Changelog\n
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).\n
+"""
+# template for the changelog body
+# https://keats.github.io/tera/docs/#introduction
+body = """
+{%- macro remote_url() -%}
+  https://github.com/{{ remote.github.owner }}/{{ remote.github.repo }}
+{%- endmacro -%}
+
+{% if version -%}
+    ## [{{ version | trim_start_matches(pat="v") }}] - {{ timestamp | date(format="%Y-%m-%d") }}
+{% else -%}
+    ## [Unreleased]
+{% endif -%}
+
+### Details\
+
+{% for group, commits in commits | group_by(attribute="group") %}
+    #### {{ group | upper_first }}
+    {%- for commit in commits %}
+        - {{ commit.message | upper_first | trim }}\
+            {% if commit.remote.username %} by @{{ commit.remote.username }}{%- endif -%}
+            {% if commit.remote.pr_number %} in \
+              [#{{ commit.remote.pr_number }}]({{ self::remote_url() }}/pull/{{ commit.remote.pr_number }}) \
+            {%- endif -%}
+    {% endfor %}
+{% endfor %}
+
+{%- if github.contributors | filter(attribute="is_first_time", value=true) | length != 0 %}
+  ## New Contributors
+{%- endif -%}
+
+{% for contributor in github.contributors | filter(attribute="is_first_time", value=true) %}
+  * @{{ contributor.username }} made their first contribution
+    {%- if contributor.pr_number %} in \
+      [#{{ contributor.pr_number }}]({{ self::remote_url() }}/pull/{{ contributor.pr_number }}) \
+    {%- endif %}
+{%- endfor %}\n
+"""
+trim = true
+
+
+[tool.git-cliff.git]
+conventional_commits = true
+filter_unconventional = true
+split_commits = false
+commit_preprocessors = [
+    { pattern = '\((\w+\s)?#([0-9]+)\)', replace = "" },
+]
+commit_parsers = [
+    { message = "^.*: add", group = "Added" },
+    { message = "^.*: support", group = "Added" },
+    { message = "^.*: remove", group = "Removed" },
+    { message = "^.*: delete", group = "Removed" },
+    { message = "^test", group = "Fixed" },
+    { message = "^fix", group = "Fixed" },
+    { message = "^.*: fix", group = "Fixed" },
+    { message = "^.*", group = "Changed" },
+]
+protect_breaking_commits = false
+filter_commits = true
+tag_pattern = "v[0-9].*"
+topo_order = false
+sort_commits = "oldest"
+
+[tool.uv.sources]
+xorq-hash-cache = { git = "https://github.com/xorq-labs/xorq-hash-cache", branch = "main" }
+xorq-weather-lib = { git = "https://github.com/xorq-labs/xorq-weather-lib", branch = "main" }
+xorq-feature-utils = { git = "https://github.com/xorq-labs/xorq-feature-utils", branch = "main" }
+
+[tool.hatch.metadata]
+allow-direct-references = true

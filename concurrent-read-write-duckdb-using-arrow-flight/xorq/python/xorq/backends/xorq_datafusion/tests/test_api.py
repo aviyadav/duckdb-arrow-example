@@ -1,0 +1,94 @@
+import numpy as np
+import pandas as pd
+import pytest
+
+import xorq.api as xo
+import xorq.vendor.ibis.expr.types as ir
+from xorq.api import SessionConfig
+
+
+@pytest.mark.xfail(reason="No purpose with no registration api")
+def test_executed_on_original_backend(parquet_dir, csv_dir, mocker):
+    con = xo.config.default_backend()
+    spy = mocker.spy(con, "execute")
+
+    parquet_table = con.read_parquet(parquet_dir / "batting.parquet")[
+        lambda t: t.yearID == 2015
+    ]
+
+    csv_table = con.read_csv(csv_dir / "batting.csv")[lambda t: t.yearID == 2014]
+
+    expr = parquet_table.join(
+        csv_table,
+        "playerID",
+    )
+
+    assert xo.execute(expr) is not None
+    assert spy.call_count == 1
+
+
+@pytest.mark.parametrize(
+    ("with_repartition_file_scans", "keep_partition_by_columns"),
+    [(True, True), (True, False), (False, True), (False, False)],
+)
+def test_with_config(
+    with_repartition_file_scans, keep_partition_by_columns, parquet_dir
+):
+    session_config = (
+        SessionConfig()
+        .with_repartition_file_scans(with_repartition_file_scans)
+        .set(
+            "datafusion.execution.keep_partition_by_columns",
+            str(keep_partition_by_columns).lower(),
+        )
+    )
+
+    con = xo.connect(session_config=session_config)
+
+    expr = con.read_parquet(parquet_dir / "batting.parquet").limit(10)
+    result = expr.execute()
+
+    assert isinstance(result, pd.DataFrame)
+    assert len(result) == 10
+
+
+def test_cases(alltypes: ir.Table) -> None:
+    expr = xo.cases((alltypes["bool_col"], alltypes["string_col"]), else_=None).substr(
+        0, 2
+    )
+
+    assert expr.execute() is not None
+
+
+def test_cases_deferred(alltypes: ir.Table) -> None:
+    deferred = xo.cases((xo._.bool_col, xo._.string_col), else_=None)
+
+    assert isinstance(deferred, xo.Deferred)
+
+    expr = alltypes.mutate(result=deferred)
+    result = expr.execute()
+    expected = result.string_col.where(result.bool_col, None)
+
+    pd.testing.assert_series_equal(result.result, expected, check_names=False)
+
+
+def test_cases_deferred_multiple_branches(alltypes: ir.Table) -> None:
+    deferred = xo.cases(
+        (xo._.int_col == 1, xo._.string_col),
+        (xo._.int_col == 2, "two"),
+        else_=xo._.string_col.upper(),
+    )
+
+    assert isinstance(deferred, xo.Deferred)
+
+    expr = alltypes.mutate(result=deferred)
+    result = expr.execute()
+    expected = pd.Series(
+        np.select(
+            (result.int_col == 1, result.int_col == 2),
+            (result.string_col, "two"),
+            default=result.string_col.str.upper(),
+        )
+    )
+
+    pd.testing.assert_series_equal(result.result, expected, check_names=False)

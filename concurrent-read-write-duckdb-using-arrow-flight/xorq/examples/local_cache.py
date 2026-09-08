@@ -1,0 +1,47 @@
+"""Demonstrates ParquetCache for local filesystem caching of postgres query results.
+
+Traditional approach: You would query postgres, use pyarrow to write the results
+to a parquet file, check whether that file already exists before re-querying,
+and manage cache invalidation yourself whenever the query logic changes.
+
+With xorq: Calling .cache(ParquetCache) on any expression adds input-addressed
+caching in one line. If the expression hasn't changed, cached parquet results are
+returned automatically -- no manual file management or invalidation logic required.
+"""
+
+from pathlib import Path
+
+import xorq.api as xo
+from xorq.caching import ParquetCache
+
+
+pg = xo.postgres.connect_examples()
+con = xo.connect()
+cache = ParquetCache.from_kwargs(
+    source=con,
+    relative_path=Path("./parquet-cache"),
+)
+
+
+cached = (
+    pg.table("functional_alltypes")
+    .into_backend(con)
+    .select(xo._.smallint_col, xo._.int_col, xo._.float_col)
+    .cache(cache=cache)
+)
+expr = cached.filter(
+    [
+        xo._.float_col > 0,
+        xo._.smallint_col > 4,
+        xo._.int_col < cached.float_col * 2,
+    ]
+)
+
+
+if __name__ == "__pytest_main__":
+    path = cache.storage.get_path(cached.ls.get_key())
+    print(f"{path} exists?: {path.exists()}")
+    result = xo.execute(expr)
+    print(f"{path} exists?: {path.exists()}")
+    print(result)
+    pytest_examples_passed = True

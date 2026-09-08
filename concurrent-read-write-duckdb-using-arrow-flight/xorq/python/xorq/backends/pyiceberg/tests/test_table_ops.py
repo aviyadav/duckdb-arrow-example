@@ -1,0 +1,115 @@
+import pyarrow as pa
+import pytest
+
+from xorq.backends.pyiceberg.tests.conftest import QUOTES_TABLE_NAME
+from xorq.vendor.ibis import Schema
+
+
+def test_create_table_from_expr(iceberg_con, quotes_table):
+    t = quotes_table.select("timestamp", "bid", "ask").limit(10).as_table()
+
+    actual_t = iceberg_con.create_table("selected_quotes", t)
+
+    assert not actual_t.execute().empty
+
+
+def identity(val):
+    return val
+
+
+def execute(val):
+    val = val.execute()
+    val["timestamp"] = val["timestamp"].astype("datetime64[us]")
+    return val
+
+
+@pytest.mark.parametrize(
+    "fun",
+    [
+        pytest.param(execute, id="pandas"),
+        pytest.param(identity, id="xorq"),
+    ],
+)
+def test_append(iceberg_con, trades_df, fun):
+    table_name = "trades"
+
+    t = iceberg_con.create_table(table_name, trades_df, overwrite=True)
+    assert table_name in iceberg_con.list_tables()
+    expected = t.execute()
+
+    iceberg_con.insert(table_name, fun(t))
+    actual = t.execute()
+    assert len(actual) == len(expected) * 2
+
+
+@pytest.mark.parametrize(
+    "fun",
+    [
+        pytest.param(execute, id="pandas"),
+        pytest.param(identity, id="xorq"),
+    ],
+)
+def test_insert_overwrite(iceberg_con, trades_df, fun):
+    table_name = "trades_overwrite"
+
+    t = iceberg_con.create_table(table_name, trades_df, overwrite=True)
+    assert table_name in iceberg_con.list_tables()
+    expected = t.execute()
+
+    # overwrite with a differently-shaped, differently-valued dataset so the
+    # test fails on a silent no-op (data unchanged) as well as on a double-append
+    new_df = trades_df.head(5).assign(price=trades_df["price"].head(5) + 1000)
+    src_name = "trades_overwrite_src"
+    new_t = iceberg_con.create_table(src_name, new_df, overwrite=True)
+
+    iceberg_con.insert(table_name, fun(new_t), mode="overwrite")
+    actual = t.execute().sort_values("timestamp").reset_index(drop=True)
+
+    assert len(actual) == len(new_df)
+    assert len(actual) != len(expected)
+    # every price reflects the +1000 offset → data was actually replaced
+    assert (actual["price"] > 1000).all()
+
+
+def test_insert_overwrite_atomic_on_schema_mismatch(iceberg_con, trades_df):
+    # a failed overwrite (schema mismatch) must abort the whole delete+append
+    # transaction, leaving the original data intact rather than truncated
+    table_name = "trades_overwrite_atomic"
+
+    t = iceberg_con.create_table(table_name, trades_df, overwrite=True)
+    expected = t.execute()
+
+    bad_df = trades_df.assign(extra=1)
+    with pytest.raises(ValueError):
+        iceberg_con.insert(table_name, bad_df, mode="overwrite")
+
+    actual = t.execute()
+    assert len(actual) == len(expected)
+
+
+def test_create_empty_raises(iceberg_con):
+    with pytest.raises(NotImplementedError):
+        schema = Schema.from_pyarrow(
+            pa.schema(
+                [
+                    pa.field("question", pa.string()),
+                    pa.field("product_description", pa.string()),
+                    pa.field("image_url", pa.string()),
+                    pa.field("label", pa.uint8(), nullable=True),
+                ]
+            )
+        )
+        iceberg_con.create_table("empty", schema=schema)
+
+
+def test_read_record_batches(iceberg_con, quotes_table):
+    table_name = "quotes_records"
+    t = iceberg_con.read_record_batches(
+        quotes_table.to_pyarrow_batches(), table_name=table_name
+    )
+    assert table_name in iceberg_con.list_tables()
+    assert not t.execute().empty
+
+
+def test_get_schema(iceberg_con):
+    iceberg_con.get_schema(QUOTES_TABLE_NAME)

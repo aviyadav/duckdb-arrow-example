@@ -1,0 +1,669 @@
+import inspect
+import itertools
+import json
+import sys
+from pathlib import Path
+from types import MappingProxyType
+
+import toolz
+import yaml12
+from attr import evolve, field, frozen
+from attr.validators import (
+    instance_of,
+    optional,
+)
+
+from xorq.backends._lazy import LazyBackend
+from xorq.common.utils.env_utils import compiled_env_var_substitution_re
+from xorq.common.utils.inspect_utils import get_arguments
+from xorq.loader import _find_entry_point, _load_entry_points, load_backend
+from xorq.vendor.ibis.config import options
+
+
+@frozen
+class Profiles:
+    """A collection interface for managing database connection profiles.
+
+    The Profiles class provides a centralized way to access, manage, and retrieve
+    Profile objects saved on the filesystem. It handles directory management,
+    profile lookup, and provides a dictionary-like and attribute-like interface
+    for accessing saved profiles.
+
+    Profiles are immutable (frozen) to ensure thread safety and prevent accidental
+    modification after creation.
+
+    Attributes
+    ----------
+    profile_dir : Path
+        Directory where profile files are stored. Defaults to xo.options.profiles.profile_dir.
+        Created automatically if it doesn't exist.
+
+    Examples
+    --------
+    Creating a Profiles collection:
+    >>> import xorq.api as xo
+    >>> from xorq.vendor.ibis.backends.profiles import Profile, Profiles
+    >>> profiles = Profiles()
+    >>> # Or with a custom directory
+    >>> from pathlib import Path
+    >>> custom_profiles = Profiles(profile_dir=Path('/path/to/profiles'))
+
+    Accessing profiles by name (attribute-style):
+    >>> Profile.from_con(xo.connect()).save(alias='example_dev')
+    >>> postgres_profile = profiles.example_dev
+
+    Accessing profiles by name (dictionary-style):
+
+    >>> again_example_dev = profiles['example_dev']
+
+    Getting a profile explicitly:
+
+    >>> profile = profiles.get('example_dev')
+
+    Listing available profiles:
+
+    >>> profiles.list()
+    ('example_dev', 'feda6956a9ca4d2bda0fbc8e775042c3_1')
+
+
+    Notes
+    -----
+    The Profiles class supports tab-completion in IPython and Jupyter environments,
+    making it easy to discover available profiles interactively.
+
+    The directory structure uses YAML files for profile storage, with optional
+    symbolic links for aliased profiles.
+
+
+
+    See Also
+    --------
+    Profile : Individual connection profile class
+    Profile.save : Save a profile to disk
+    Profile.load : Load a profile from disk
+    """
+
+    profile_dir = field(validator=optional(instance_of(Path)), default=None)
+
+    def __attrs_post_init__(self):
+        if self.profile_dir is None:
+            # defer setting to pick up in-process changes to options
+            object.__setattr__(self, "profile_dir", options.profiles.profile_dir)
+        if not self.profile_dir.exists():
+            self.profile_dir.mkdir(exist_ok=True, parents=True)
+
+    def get(self, name):
+        return Profile.load(name, profile_dir=self.profile_dir)
+
+    def __getattr__(self, stem):
+        try:
+            return self.get(
+                next(el.name for el in self.profile_dir.iterdir() if el.stem == stem)
+            )
+        except Exception:
+            return object.__getattribute__(self, stem)
+
+    def __getitem__(self, stem):
+        return self.get(
+            next(el.name for el in self.profile_dir.iterdir() if el.stem == stem)
+        )
+
+    def __dir__(self):
+        return tuple(el for el in self.list() if el.isidentifier())
+
+    def list(self):
+        return tuple(el.stem for el in self.profile_dir.iterdir())
+
+    def _ipython_key_completions_(self):
+        return self.list()
+
+
+@frozen
+class Profile:
+    """A representation of a database connection profile that can be saved and loaded.
+
+    The Profile class encapsulates all the information needed to establish a database
+    connection, including connection type and parameters. It supports serialization to
+    and deserialization from YAML, environment variable substitution, and security
+    checks to prevent sensitive information from being stored in plain text.
+
+    Profiles are immutable (frozen) to ensure thread safety and prevent accidental
+    modification after creation.
+
+    Attributes
+    ----------
+    con_name : str
+        Name of the connection backend (e.g., 'postgres', 'snowflake')
+    kwargs_tuple : tuple
+        Connection parameters as a tuple of (key, value) pairs
+    idx : int
+        Unique identifier for this profile instance, auto-generated if not provided
+
+    Examples
+    --------
+    Creating a profile with environment variables for sensitive information:
+
+    >>> profile = Profile(
+    ...     con_name='postgres',
+    ...     kwargs_tuple=(
+    ...         ('host', '${POSTGRES_HOST}'),
+    ...         ('port', 5432),
+    ...         ('database', 'mydb'),
+    ...         ('user', '${POSTGRES_USER}'),
+    ...         ('password', '${POSTGRES_PASSWORD}'),
+    ...     )
+    ... )
+
+    Saving a profile:
+
+    >>> profile.save(alias='my_postgres')
+
+    Loading a profile:
+
+    >>> loaded_profile = Profile.load('my_postgres')
+
+    Creating a connection from a profile:
+
+    >>> connection = profile.get_con()
+
+    Creating a profile from an existing connection:
+
+    >>> new_profile = Profile.from_con(connection)
+
+    Notes
+    -----
+    Sensitive information like passwords should be stored as environment variable
+    references (${VAR} or $VAR) to prevent security risks. The `save` method will
+    raise a ValueError if sensitive data is not stored as environment variables.
+    """
+
+    con_name = field(validator=instance_of(str))
+    kwargs_tuple = field(validator=instance_of(tuple))
+    idx = field(validator=instance_of(int), factory=itertools.count().__next__)
+
+    @con_name.validator
+    def validate_con_name(self, attr, value):
+        # _find_entry_point, not a direct scan of the cache: see its docstring.
+        # On a miss it has refreshed, so the names below are the fresh ones.
+        if _find_entry_point(value) is None:
+            installed = sorted(ep.name for ep in _load_entry_points())
+            raise ValueError(
+                f"Unknown backend {value!r}; installed backends: {installed}"
+            )
+
+    def __attrs_post_init__(self):
+        # Sort kwargs_tuple after initialization
+        object.__setattr__(self, "kwargs_tuple", tuple(sorted(self.kwargs_tuple)))
+
+    @property
+    def kwargs_dict(self):
+        return dict(self.kwargs_tuple)
+
+    @property
+    def content_hash(self):
+        """Digest of this profile's connection content, excluding session-local `idx`.
+
+        Two `Profile`s describing the same backend config hash equal here
+        even if their `idx` differs (e.g. two independently-constructed
+        profiles for the same connection in the same process). This is
+        what `xorq.ibis_yaml.compiler.profile_content_key` returns.
+        """
+        from xorq.common.utils.dasher import tokenize  # noqa: PLC0415
+
+        return tokenize(toolz.dissoc(self.as_dict(), "idx"))
+
+    @property
+    def hash_name(self):
+        return f"{self.content_hash}_{self.idx}"
+
+    def get_con(self, lazy=False, **kwargs):
+        """Create a connection using this profile's parameters.
+
+        Parameters
+        ----------
+        lazy : bool, default False
+            If True, return a LazyBackend that defers ``do_connect`` until the
+            first attribute access. If False, connect immediately.
+        """
+        _kwargs = dict(self.kwargs_tuple) | kwargs
+        connect = getattr(load_backend(self.con_name), "connect")
+        if lazy:
+            return LazyBackend(connect, **_kwargs)
+        return connect(**_kwargs)
+
+    def clone(self, idx=None, **kwargs):
+        idx = idx if idx is not None else self.idx
+        kwargs_tuple = tuple((dict(self.kwargs_tuple) | kwargs).items())
+
+        return evolve(self, idx=idx, kwargs_tuple=kwargs_tuple)
+
+    def as_dict(self):
+        return {
+            name: getattr(self, name)
+            for name in (attr.name for attr in self.__attrs_attrs__)
+        }
+
+    def as_json(self):
+        return json.dumps(self.as_dict())
+
+    def as_yaml(self):
+        return yaml12.format_yaml(
+            {
+                "con_name": self.con_name,
+                "kwargs_dict": self.kwargs_dict,
+                "idx": self.idx,
+            }
+        )
+
+    def save(self, profile_dir=None, alias=None, clobber=False, check_secrets=True):
+        """Save this profile to disk as a YAML file.
+
+        This method serializes the profile to YAML format and writes it to a file in the
+        specified profile directory. The filename is automatically generated based on a hash
+        of the profile's content, ensuring uniqueness. Optionally creates a symlink with a
+        user-friendly alias name for easier access.
+
+        Before saving, the method can check for exposed secret keys (like passwords) and
+        ensure they're stored as environment variable references rather than plain text.
+
+        Parameters
+        ----------
+        profile_dir : Path, optional
+            Directory where the profile will be saved. If None, uses the default directory
+            from xo.options.profiles.profile_dir.
+        alias : str, optional
+            If provided, creates a symbolic link with this name pointing to the saved profile
+            file. Useful for giving profiles memorable names.
+        clobber : bool, default False
+            If True, overwrites existing files with the same name. If False and a file with
+            the same name exists, returns the existing file path without overwriting.
+        check_secrets : bool, default True
+            If True, checks that sensitive information (like passwords) is stored as
+            environment variable references before saving. If False, skips this check.
+
+        Returns
+        -------
+        Path
+            Path to the saved profile file or alias symlink (if created).
+
+        Raises
+        ------
+        ValueError
+            If check_secrets is True and the profile contains exposed secret keys.
+            If clobber is False and an alias path already exists.
+
+        Notes
+        -----
+        The saved YAML file contains the connection type, parameters, and a unique identifier.
+        The file is saved with a hash-based name to ensure uniqueness, but for user-friendly
+        access, an alias (symlink) can be created.
+
+        Environment variable references in the profile are saved as-is, not substituted with
+        actual values, to maintain security and portability.
+
+        See Also
+        --------
+        load : Load a previously saved profile
+        check_for_exposed_secrets : Check for sensitive information not using env vars
+
+        Examples
+        --------
+        >>> # Save a profile with default options
+        >>> profile.save()
+
+
+        >>> # Save with an alias name
+        >>> profile.save(alias='postgres_dev')
+
+
+        >>> # Save to a custom directory and overwrite if exists
+        >>> from pathlib import Path
+        >>> custom_dir = Path('/path/to/profiles')
+        >>> profile.save(profile_dir=custom_dir, clobber=True)
+
+
+        >>> # Save without checking for exposed secrets (not recommended)
+        >>> profile.save(check_secrets=False)
+        """
+        if check_secrets:
+            self.check_for_exposed_secrets()
+        path = self.get_path(self.hash_name, profile_dir=profile_dir)
+        if not path.exists():
+            path.write_text(self.as_yaml())
+        if alias:
+            alias_path = self.get_path(alias, profile_dir=profile_dir)
+            if alias_path.exists():
+                if not clobber:
+                    raise ValueError
+                alias_path.unlink()
+            alias_path.symlink_to(path)
+            return alias_path
+        return path
+
+    def check_for_exposed_secrets(self):
+        check_for_exposed_secrets(self.con_name, self.kwargs_dict)
+
+    def almost_equals(self, other):
+        return self.clone(idx=-1) == other.clone(idx=-1)
+
+    @classmethod
+    def get_path(cls, name, profile_dir=None):
+        profile_dir = profile_dir or options.profiles.profile_dir
+        profile_dir.mkdir(exist_ok=True, parents=True)
+        path = profile_dir.joinpath(name).with_suffix(".yaml")
+        return path
+
+    @classmethod
+    def load(cls, name, profile_dir=None):
+        """Load a Profile from disk by name or hash.
+
+        This method retrieves a serialized Profile from the filesystem and deserializes it
+        into a Profile object. It handles locating the profile file, parsing the YAML
+        content, and reconstructing the Profile with all its original parameters.
+
+        Parameters
+        ----------
+        name : str
+            The name or hash identifier of the profile to load. This can be either an alias
+            name created during save or the hash-based filename.
+        profile_dir : Path, optional
+            Directory containing profile files. If None, uses the default directory from
+            xo.options.profiles.profile_dir.
+
+        Returns
+        -------
+        Profile
+            A Profile object with the connection parameters loaded from the file.
+
+        Raises
+        ------
+        FileNotFoundError
+            If no profile with the given name exists in the profile directory.
+        ValueError
+            If the profile file exists but contains invalid or incomplete data.
+
+        Notes
+        -----
+        The loaded profile will have the same unique identifier (idx) as when it was saved,
+        preserving its identity across serialization cycles. Environment variable references
+        in the profile are preserved and not substituted during loading.
+
+        See Also
+        --------
+        save : Save a Profile to disk
+        get_path : Get the filesystem path for a profile name
+
+        Examples
+        --------
+        >>> # Load a profile by its alias
+        >>> profile = Profile.load('postgres_dev')
+        >>>
+        >>> # Load a profile from a non-default directory
+        >>> from pathlib import Path
+        >>> custom_dir = Path('/path/to/profiles')
+        >>> profile = Profile.load('postgres_dev', profile_dir=custom_dir)
+        """
+        path = cls.get_path(name, profile_dir=profile_dir)
+        env = yaml12.parse_yaml(path.read_text())
+        con_name = env.get("con_name")
+        kwargs_dict = env.get("kwargs_dict")
+        idx = env.get("idx")
+        sorted_kwargs = tuple(sorted(kwargs_dict.items()))
+        return cls(con_name=con_name, kwargs_tuple=sorted_kwargs, idx=idx)
+
+    @classmethod
+    def from_con(cls, con, *args, **kwargs):
+        """Create a Profile from a connection, preserving env var references if possible."""
+
+        def get_combined_arguments():
+            # these are the env-mapped values
+            arguments0 = get_arguments(
+                con.do_connect, *con._con_args, **con._con_kwargs
+            )
+            # these are the "raw" values (if passed)
+            arguments1 = toolz.valfilter(
+                bool, get_arguments(con.do_connect, *args, **kwargs)
+            )
+            assert not arguments0.get("args")
+            assert not arguments1.get("args")
+            arguments = toolz.dissoc(arguments0 | arguments1, "args")
+            return arguments
+
+            # If connection already has a profile, return it to preserve env vars
+
+        if hasattr(con, "_profile") and con._profile is not None:
+            return con._profile
+
+        if con.name == "xorq_flight":
+            return None
+
+        kwargs_name = "config" if con.name == "duckdb" else "kwargs"
+        arguments = get_combined_arguments()
+        kwargs = toolz.dissoc(arguments, kwargs_name) | arguments.get(kwargs_name, {})
+
+        # Fix port type if needed
+        if (
+            "port" in kwargs
+            and kwargs["port"] is not None
+            and isinstance(kwargs["port"], str)
+        ):
+            kwargs["port"] = int(kwargs["port"])
+
+        return cls(con_name=con.name, kwargs_tuple=tuple(sorted(kwargs.items())))
+
+
+# Static secret keys by connection name, mirrored from each backend's
+# `Backend._secret_keys` declaration. `check_for_exposed_secrets` reads this
+# mirror at runtime so that validating a profile never imports the backend just
+# to read its tuple. The colocated `_secret_keys` declaration is the authored
+# source; the tests in test_profile.py enforce, in both directions, that this
+# mirror stays identical to it.
+con_name_to_secret_keys = MappingProxyType(
+    {
+        "postgres": (
+            "password",
+            "sslcert",
+            "sslkey",
+            "sslrootcert",
+            "sslcrl",
+            "options",
+            "passfile",
+        ),
+        "snowflake": (
+            "password",
+            "user",
+            "account",
+            "token",
+            "private_key",
+            "private_key_path",
+            "oauth_token",
+        ),
+    }
+)
+
+
+# Checked for every backend, on top of the mirror and the declared sources: a
+# backend cannot declare that a kwarg literally named `password` is not a secret.
+default_secret_keys = ("password",)
+
+
+# Declarative secret-key sources by connection name, mirrored from each backend's
+# `Backend._secret_key_sources` exactly as `con_name_to_secret_keys` mirrors
+# `_secret_keys`. Mirroring data means resolution never needs the backend imported.
+con_name_to_secret_key_sources = MappingProxyType({})
+
+
+def _resolve_source(source: tuple[str, ...], kwargs: dict) -> tuple[str, ...] | None:
+    """The names ``source`` points at inside ``kwargs``, or None when it doesn't
+    resolve. Every read is through an unbound builtin, so a subclass's
+    ``get``/``__getitem__``/``__missing__``/``__iter__``/``__str__`` is bypassed
+    and the true underlying data is read; the names come back as exact ``str``
+    copies, since a ``str`` subclass reaching the caller could forge the ``__eq__``
+    that matches it against a kwarg or the ``__hash__`` that dedupes it. (Dict
+    probing can still run a *stored* key's ``__eq__`` on a hash collision; one
+    that raises is caught below, and one that lies can only redirect among values
+    already in the kwargs.) Anything that isn't a ``dict`` at a step, or a
+    ``list``/``tuple`` at the leaf, is unresolved rather than reached into --
+    ``secret_fields: null`` falls through, while ``[]`` resolves to ``()``.
+    """
+    value = kwargs
+    for step in source:
+        if not isinstance(value, dict):
+            return None
+        value = dict.get(value, step)
+    if isinstance(value, (list, tuple)):
+        names = (tuple if isinstance(value, tuple) else list).__iter__(value)
+        return tuple(str.__str__(name) for name in names if isinstance(name, str))
+    return None
+
+
+def _well_formed_sources(sources) -> tuple[tuple[str, ...], ...]:
+    """The sources shaped like sources: a non-empty tuple of ``str`` steps. A
+    malformed one contributes nothing; shape is pinned by the mirror tests."""
+    return tuple(
+        source
+        for source in sources
+        if isinstance(source, tuple)
+        and source
+        and all(isinstance(step, str) for step in source)
+    )
+
+
+def _imported_backend(con_name: str) -> type | None:
+    """The already-imported Backend class for ``con_name``, or None -- never
+    importing, since validating a profile must not import a heavy backend."""
+    entry_point = _find_entry_point(con_name)
+    if entry_point is None:
+        return None
+    module = sys.modules.get(entry_point.module)
+    if module is None:
+        return None
+    backend = inspect.getattr_static(module, "Backend", None)
+    return backend if isinstance(backend, type) else None
+
+
+def _static_secret_keys_for(con_name: str) -> tuple[str, ...]:
+    """Every static secret key for ``con_name``: the mirror entry, topped up
+    from ``_secret_keys`` on an already-imported backend, exactly as
+    ``_secret_key_sources_for`` tops up the declared sources -- how an
+    out-of-tree backend, unable to add a mirror entry, keeps the tier. The
+    class is plugin-authored data, so it is read like the resolver reads a
+    leaf: unbound ``tuple.__iter__``, and the names come back as exact ``str``
+    copies, since a ``str`` subclass reaching the caller could forge the
+    ``__eq__`` that matches it against a kwarg or the ``__hash__`` that
+    dedupes it in ``get_secret_keys``."""
+    keys = tuple(con_name_to_secret_keys.get(con_name, ()))
+    if (backend := _imported_backend(con_name)) is not None:
+        declared = inspect.getattr_static(backend, "_secret_keys", ())
+        if isinstance(declared, tuple):
+            keys += tuple(
+                str.__str__(name)
+                for name in tuple.__iter__(declared)
+                if isinstance(name, str)
+            )
+    return keys
+
+
+def _secret_key_sources_for(con_name: str) -> tuple[tuple[str, ...], ...]:
+    """Every declared source for ``con_name``: the mirror entry, topped up from
+    ``_secret_key_sources`` on an already-imported backend, which is how an
+    out-of-tree backend -- unable to add a mirror entry -- keeps the tier.
+    ``getattr_static`` cannot fire a descriptor, so a ``property`` declaration
+    contributes nothing instead of executing."""
+    sources = tuple(con_name_to_secret_key_sources.get(con_name, ()))
+    if (backend := _imported_backend(con_name)) is not None:
+        declared = inspect.getattr_static(backend, "_secret_key_sources", ())
+        if isinstance(declared, tuple):
+            sources += declared
+    return tuple(dict.fromkeys(_well_formed_sources(sources)))
+
+
+def get_declared_secret_keys(
+    con_name: str, kwargs: dict | None = None
+) -> tuple[str, ...]:
+    """The first resolving declared source's names, or ``()`` -- tier 3 of
+    ``get_secret_keys``. A backend whose secret kwarg names depend on the kwargs
+    themselves declares *where the names live*, as static class data::
+
+        _secret_key_sources = (
+            ("config", "auth", "secret_fields"),
+            ("config", "auth", "fields"),
+        )
+
+    The first source that resolves wins, and the names it yields are matched against
+    the **top level** of the kwargs, so for ``{"config": {"token": ...}}`` a source
+    yielding ``"token"`` matches nothing.
+    """
+    kwargs = kwargs if kwargs is not None else {}
+    for source in _secret_key_sources_for(con_name):
+        try:
+            names = _resolve_source(source, kwargs)
+        except Exception as e:
+            # a hostile object in kwargs, not a declaration bug: fail closed. Only
+            # our own source is interpolated, so no kwarg value can leak here.
+            raise ValueError(
+                f"{con_name}: could not resolve secret-key source {source}: "
+                f"{type(e).__name__}"
+            ) from e
+        if names is not None:
+            return names
+    return ()
+
+
+def get_secret_keys(con_name: str, kwargs: dict | None = None) -> tuple[str, ...]:
+    """Return every secret key to check for ``con_name``: the *union* of
+
+    1. the unconditional ``default_secret_keys`` (``("password",)``),
+    2. the static keys: the ``con_name_to_secret_keys`` mirror entry, topped up
+       from ``_secret_keys`` on an already-imported backend,
+    3. the backend's declared ``_secret_key_sources``, resolved against kwargs.
+
+    Unioning is what keeps this monotone: an empty, narrower, or unresolved tier 3
+    leaves tiers 1 and 2 intact, so a declaration can only widen what is checked.
+    Ordering is deterministic -- first occurrence wins, tiers in the order above.
+    """
+    return tuple(
+        dict.fromkeys(
+            (
+                *default_secret_keys,
+                *_static_secret_keys_for(con_name),
+                *get_declared_secret_keys(con_name, kwargs),
+            )
+        )
+    )
+
+
+def check_for_exposed_secrets(con_name: str, kwargs: dict) -> None:
+    """Check if profile contains exposed secret keys.
+
+    The keys come from `get_secret_keys`, which unions the unconditional
+    default, the static mirror, and the backend's declared secret-key sources.
+
+    Raises
+    ------
+    ValueError
+        If profile contains exposed secret keys not using environment variables
+    """
+
+    relevant_keys = get_secret_keys(con_name, kwargs)
+
+    exposed_secrets = tuple(
+        key
+        # unbound, like the reads in _resolve_source: a subclass's items() could
+        # otherwise hide the very kwarg the resolver just named. A str-subclass
+        # *key* forging __eq__ can still evade the membership test below --
+        # accepted: a hostile caller could as easily rename the kwarg, and the
+        # serialized profile carries the key's own str value either way.
+        for key, value in dict.items(kwargs)
+        if key in relevant_keys
+        and not (
+            isinstance(value, str) and compiled_env_var_substitution_re.match(value)
+        )
+    )
+    if exposed_secrets:
+        secrets_list = ", ".join(f"'{key}'" for key in exposed_secrets)
+        env_var_examples = ", ".join(f"${key} or ${{{key}}}" for key in exposed_secrets)
+        raise ValueError(
+            f"Profile contains exposed secret keys: {secrets_list}. "
+            f"Use environment variables ({env_var_examples}) for these values."
+        )

@@ -1,0 +1,904 @@
+"""xorq expression API definitions."""
+
+from __future__ import annotations
+
+import functools
+from collections.abc import Generator
+from contextlib import contextmanager
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Mapping
+
+import pyarrow as pa
+import toolz
+
+import xorq.vendor.ibis.expr.datatypes as dt
+import xorq.vendor.ibis.expr.operations as ops
+import xorq.vendor.ibis.expr.types as ir
+from xorq.backends.xorq_datafusion import Backend
+from xorq.common.exceptions import XorqError
+from xorq.common.utils.caching_utils import find_backend
+from xorq.common.utils.defer_utils import (  # noqa: F403
+    deferred_read_csv,
+    deferred_read_parquet,
+)
+from xorq.common.utils.graph_utils import replace_nodes, walk_nodes
+from xorq.common.utils.io_utils import (
+    extract_suffix,
+    maybe_open,
+)
+from xorq.common.utils.otel_utils import get_current_span, tracer
+from xorq.common.utils.rbr_utils import otel_instrument_reader
+from xorq.expr.enums import Traversal
+from xorq.expr.ml import (
+    calc_split_column,
+    train_test_splits,
+)
+from xorq.expr.operations import _MISSING, NamedScalarParameter
+from xorq.expr.relations import (
+    TEE_PASS,
+    CachedNode,
+    CacheTag,
+    FlightExpr,
+    FlightUDXF,
+    HashingTag,
+    Read,
+    Tag,
+    TeeNode,
+)
+from xorq.expr.remote_table_exec import (
+    REMOTE_PASS,
+    RemoteTableScope,
+    bind_scope_to_reader,
+)
+from xorq.expr.transform import (
+    Replacer,
+    TransformCtx,
+    TransformPass,
+    run_transform_passes,
+)
+from xorq.vendor.ibis.backends import BaseBackend
+from xorq.vendor.ibis.expr import api
+from xorq.vendor.ibis.expr.api import *  # noqa: F403
+from xorq.vendor.ibis.expr.sql import SQLString
+from xorq.vendor.ibis.expr.types import Expr
+
+
+if TYPE_CHECKING:
+    from io import TextIOWrapper
+    from pathlib import Path
+
+    import pandas as pd
+    import pyarrow as pa
+
+__all__ = (
+    "execute",
+    "calc_split_column",
+    "get_backend",
+    "read_pyarrow_stream",
+    "register",
+    "set_backend",
+    "train_test_splits",
+    "to_parquet",
+    "to_csv",
+    "to_json",
+    "to_pyarrow",
+    "to_pyarrow_batches",
+    "to_pyarrow_stream",
+    "to_sql",
+    "get_plans",
+    "deferred_read_csv",
+    "deferred_read_parquet",
+    "get_object_metadata",
+    "bind_params",
+    *api.__all__,
+)
+
+
+def set_backend(backend: str | BaseBackend) -> None:
+    """Set the default xorq backend.
+
+    Parameters
+    ----------
+    backend
+        May be a backend name or URL, or an existing backend instance.
+
+    Examples
+    --------
+    You can pass the backend as a name:
+
+    >>> import xorq
+    >>> xorq.set_backend("datafusion")  # doctest: +SKIP
+
+    Or as a URI:
+
+    >>> xorq.set_backend(
+    ...     "postgres://user:password@hostname:5432"
+    ... )  # quartodoc: +SKIP # doctest: +SKIP
+
+    Or as an existing backend instance:
+
+    >>> con = xorq.connect()  # doctest: +SKIP
+    >>> xorq.set_backend(con)  # doctest: +SKIP
+
+    """
+    from xorq.config import options  # noqa: PLC0415
+    from xorq.loader import load_backend  # noqa: PLC0415
+    from xorq.vendor.ibis.backends import connect as ibis_connect  # noqa: PLC0415
+
+    if isinstance(backend, str):
+        if backend.isidentifier():
+            backend = load_backend(backend).connect()
+        else:
+            # URL path also dispatches through the ``xorq.backends`` entry
+            # points (see ``xorq.loader.load_backend``), so the resulting
+            # backend is a xorq backend, not the vendored ibis one.
+            backend = ibis_connect(backend)
+
+    options.default_backend = backend
+
+
+def get_backend(expr: Expr | None = None) -> BaseBackend:
+    """Get the xorq backend to use for a given expression.
+
+    Parameters
+    ----------
+    expr
+        An expression to get the backend from. If not passed, the default
+        backend is returned.
+
+    Returns
+    -------
+    BaseBackend
+        The backend.
+
+    """
+    if expr is None:
+        from xorq.config import default_backend  # noqa: PLC0415
+
+        return default_backend()
+    return expr._find_backend(use_default=True)
+
+
+def read_pyarrow_stream(
+    source,
+    con=None,
+    table_name=None,
+    **kwargs,
+) -> ir.Table:
+    from xorq.config import default_backend  # noqa: PLC0415
+
+    con = con or default_backend()
+    rbr = pa.ipc.open_stream(source, **kwargs)
+    return con.read_record_batches(rbr, table_name=table_name)
+
+
+def register(
+    source: str | Path | pa.Table | pa.RecordBatch | pa.Dataset | pd.DataFrame,
+    table_name: str | None = None,
+    **kwargs: Any,
+):
+    from xorq.config import default_backend  # noqa: PLC0415
+
+    con = default_backend()
+    return con.register(source, table_name=table_name, **kwargs)
+
+
+@functools.cache
+def _cached_with_op(op, pretty, compiler):
+    expr = op.to_expr()
+    sg_expr = compiler.to_sqlglot(expr)
+    sql = sg_expr.sql(dialect=compiler.dialect, pretty=pretty)
+    return sql
+
+
+get_compiler = toolz.excepts(
+    (XorqError, AttributeError),
+    lambda e: e._find_backend(use_default=True).compiler,
+    lambda _: Backend.compiler,
+)
+
+
+def to_sql(expr: ir.Expr, compiler=None, pretty: bool = True) -> SQLString:
+    """Return the formatted SQL string for an expression.
+
+    Parameters
+    ----------
+    expr
+        Ibis expression.
+    compiler
+        The target compiler to use to translate the Ibis expr
+    pretty
+        Whether to use pretty formatting.
+
+    Returns
+    -------
+    str
+        Formatted SQL string
+
+    """
+
+    assert isinstance(expr, ir.Expr)
+
+    if compiler is None:
+        compiler = get_compiler(expr)
+
+    unbound = _remove_tee_nodes(_remove_tag_nodes(expr)).unbind().op()
+    return SQLString(_cached_with_op(unbound, pretty, compiler))
+
+
+def _make_cache_replacer(expr: ir.Expr) -> Replacer:
+    """Build the BOUNDARY replacer that sequentially executes any CachedNode that
+    is not already cached (``set_default`` materializes as a side effect)."""
+    op = expr.op()
+    root_is_cached = isinstance(op, CachedNode)
+
+    def fn(node, kwargs):
+        is_root = root_is_cached and node is op
+        if kwargs:
+            node = node.__recreate__(kwargs)
+        if isinstance(node, CachedNode):
+            uncached, cache = node.parent, node.cache
+            parquet_metadata = None
+            # Only stamp provenance on the root CachedNode: inner cached nodes
+            # are independently keyed and will get their own provenance when
+            # they are the root of a separate execute() call.
+            # We use `expr` (the original full expression from the closure) so
+            # that the embedded hash matches what build_expr produces.
+            if is_root and hasattr(cache.storage, "get_path"):
+                from xorq.common.utils.provenance_utils import (  # noqa: PLC0415
+                    build_provenance_metadata,
+                )
+
+                parquet_metadata = build_provenance_metadata(
+                    expr, cache.strategy, cache.storage
+                )
+            node = cache.set_default(
+                uncached, uncached.op(), parquet_metadata=parquet_metadata
+            )
+        return node
+
+    return fn
+
+
+def _make_deferred_reads_replacer() -> Replacer:
+    """Build the BOUNDARY replacer that resolves each deferred `Read` via
+    ``make_dt()`` at this execution boundary."""
+    span = get_current_span()
+
+    def replace_read(node, _kwargs):
+        if isinstance(node, Read):
+            read_kwargs = dict(node.read_kwargs)
+            span.add_event(
+                "replace_read",
+                {
+                    "engine": node.source.name,
+                    "method_name": node.method_name,
+                    "path": str(
+                        read_kwargs.get("hash_path")
+                        or read_kwargs.get("source")
+                        or read_kwargs.get("source_list")
+                    ),
+                },
+            )
+            # FIXME: pandas read is not lazy, leave it to the pandas executor to do
+            node = node.make_dt()
+        else:
+            if _kwargs:
+                node = node.__recreate__(_kwargs)
+        return node
+
+    return replace_read
+
+
+@tracer.start_as_current_span("execute")
+def execute(expr: ir.Expr, **kwargs: Any):
+    """Execute an expression against its backend if one exists.
+
+    Parameters
+    ----------
+    kwargs
+        Keyword arguments
+
+    Examples
+    --------
+    >>> import xorq.api as xo
+    >>> t = xo.examples.penguins.fetch()
+    >>> t.execute()
+           species     island  bill_length_mm  ...  body_mass_g     sex  year
+    0       Adelie  Torgersen            39.1  ...       3750.0    male  2007
+    1       Adelie  Torgersen            39.5  ...       3800.0  female  2007
+    2       Adelie  Torgersen            40.3  ...       3250.0  female  2007
+    3       Adelie  Torgersen             NaN  ...          NaN    None  2007
+    4       Adelie  Torgersen            36.7  ...       3450.0  female  2007
+    ..         ...        ...             ...  ...          ...     ...   ...
+    339  Chinstrap      Dream            55.8  ...       4000.0    male  2009
+    340  Chinstrap      Dream            43.5  ...       3400.0  female  2009
+    341  Chinstrap      Dream            49.6  ...       3775.0    male  2009
+    342  Chinstrap      Dream            50.8  ...       4100.0    male  2009
+    343  Chinstrap      Dream            50.2  ...       3775.0  female  2009
+    [344 rows x 8 columns]
+
+    Scalar parameters can be supplied dynamically during execution.
+    >>> species = xo.param("string")
+    >>> expr = t.filter(t.species == species).order_by(t.bill_length_mm)
+    >>> expr.execute(limit=3, params={species: "Gentoo"})
+      species  island  bill_length_mm  ...  body_mass_g     sex  year
+    0  Gentoo  Biscoe            40.9  ...         4650  female  2007
+    1  Gentoo  Biscoe            41.7  ...         4700  female  2009
+    2  Gentoo  Biscoe            42.0  ...         4150  female  2007
+    <BLANKLINE>
+    [3 rows x 8 columns]
+    """
+
+    if (con := expr._find_backend(use_default=True)).name == "pandas":
+        return _pandas_execute(con, expr, **kwargs)
+
+    batch_reader = to_pyarrow_batches(expr, **kwargs)
+    with tracer.start_as_current_span("read_pandas"):
+        df = batch_reader.read_pandas(timestamp_as_object=True)
+    return expr.__pandas_result__(df)
+
+
+def _make_remove_tag_nodes_replacer() -> Replacer:
+    """Build the DESCEND replacer that strips `Tag` wrappers, re-walking the
+    unwrapped parent so nested tags collapse to their first non-Tag ancestor."""
+
+    def replacer(node, kwargs):
+        if isinstance(node, Tag):
+            while isinstance(node, Tag):
+                node = node.parent
+            node = replace_nodes(replacer, node)
+        elif kwargs:
+            node = node.__recreate__(kwargs)
+        return node
+
+    return replacer
+
+
+@tracer.start_as_current_span("_remove_tag_nodes")
+def _remove_tag_nodes(expr: ir.Expr) -> ir.Expr:
+    return replace_nodes(_make_remove_tag_nodes_replacer(), expr).to_expr()
+
+
+@tracer.start_as_current_span("_remove_tee_nodes")
+def _remove_tee_nodes(expr: ir.Expr) -> ir.Expr:
+    """Strip transparent `TeeNode`s to their parent (for SQL / hashing).
+
+    Execution keeps the `TeeNode` until the tee pass (`TEE_PASS`) fires the
+    write, so this is only used off the execution path.
+    """
+
+    def replacer(node, kwargs):
+        if kwargs:
+            node = node.__recreate__(kwargs)
+        if isinstance(node, TeeNode):
+            while isinstance(node, TeeNode):
+                node = node.parent
+        return node
+
+    return replace_nodes(replacer, expr).to_expr()
+
+
+@tracer.start_as_current_span("_remove_non_hashing_tag_nodes")
+def _remove_non_hashing_tag_nodes(expr):
+    """Strip Tag nodes but preserve HashingTag nodes during hash computation."""
+
+    def replacer(node, kwargs):
+        match node:
+            case HashingTag():
+                if kwargs:
+                    node = node.__recreate__(kwargs)
+                return node
+            case CacheTag():
+                # Identity-bearing (a build-hash leaf via __dasher_tokenize__),
+                # not a transparent tag: like HashingTag it must survive
+                # stripping, else `untagged`-based hashes reduce a pin to its
+                # bare cache read and diverge from get_expr_hash / ls.tokenized.
+                if kwargs:
+                    node = node.__recreate__(kwargs)
+                return node
+            case Tag():
+                # Stop at HashingTag/CacheTag: unwinding plain Tags must not
+                # strip an identity-bearing tag nested beneath them (the
+                # trailing replace_nodes preserves it via its own case).
+                while isinstance(node, Tag) and not isinstance(
+                    node, (HashingTag, CacheTag)
+                ):
+                    node = node.parent
+                return replace_nodes(replacer, node)
+            case TeeNode():
+                if kwargs:
+                    node = node.__recreate__(kwargs)
+                while isinstance(node, TeeNode):
+                    node = node.parent
+                return node
+            case _:
+                if kwargs:
+                    node = node.__recreate__(kwargs)
+                return node
+
+    return replace_nodes(replacer, expr).to_expr()
+
+
+@tracer.start_as_current_span("_resolve_params")
+def _resolve_params(params):
+    """Resolve param keys to a {name: value} dict.
+
+    Accepts a mapping where keys can be:
+    - ``xorq.param()`` expressions (NamedScalarParameter)
+    - plain strings (param names)
+
+    Raises TypeError for legacy ``ibis.param()`` expressions or unsupported key types.
+    """
+    from xorq.vendor.ibis.expr.operations.generic import (  # noqa: PLC0415
+        ScalarParameter,
+    )
+
+    name_values = {}
+    errors = []
+    for p, v in (params or {}).items():
+        match getattr(p, "op", lambda: None)():
+            case NamedScalarParameter() as op:
+                name_values[op.label] = v
+            case ScalarParameter():
+                errors.append(
+                    "Legacy ibis.param() expressions are not supported as param keys. "
+                    "Use xorq.param(name, dtype) and pass {name: value} dicts instead."
+                )
+            case None if isinstance(p, str):
+                name_values[p] = v
+            case _:
+                errors.append(f"Unsupported param key type: {type(p)}")
+    if errors:
+        raise TypeError("\n".join(errors))
+    return name_values
+
+
+# The tier-1 transform as a declarative, ordered table (see xorq.expr.transform).
+# Each record fixes its own traversal kind (DESCEND vs BOUNDARY) and ``after``
+# ordering, so the driver -- not a per-call-site convention -- picks the walk and
+# asserts the dependency chain: bind -> tags -> cache -> tee -> remote -> reads.
+# ``produces_resources`` passes (tee, remote) adopt into the shared scope; cache
+# materializes persistent parquet and owns nothing scope-tracked.
+_PASSES = (
+    TransformPass(
+        name="bind_params",
+        traversal=Traversal.DESCEND,
+        # No ``when`` gate: ``build`` (via ``_resolve_bind_op_params``) already
+        # walks for NamedScalarParameters and the replacer no-ops on empty
+        # bindings, so a gate would only duplicate that walk -- and this pass
+        # always fuses with ``remove_tags`` into one walk, so gating saves none.
+        build=lambda expr, ctx: _make_bind_params_replacer(
+            _resolve_bind_op_params(expr, ctx.name_values)
+        ),
+    ),
+    TransformPass(
+        name="remove_tags",
+        traversal=Traversal.DESCEND,
+        build=lambda expr, ctx: _make_remove_tag_nodes_replacer(),
+    ),
+    TransformPass(
+        name="cache",
+        traversal=Traversal.BOUNDARY,
+        build=lambda expr, ctx: _make_cache_replacer(expr),
+        after=("bind_params", "remove_tags"),
+    ),
+    # TEE_PASS / REMOTE_PASS are defined with their replacers; their ``after`` is
+    # echoed here so the whole chain reads in one place (the driver still checks
+    # each record's real ``after``, so an echo that drifts raises).
+    TEE_PASS,  # BOUNDARY; after=("cache",)
+    REMOTE_PASS,  # BOUNDARY; after=("tee",)
+    TransformPass(
+        name="deferred_reads",
+        traversal=Traversal.BOUNDARY,
+        build=lambda expr, ctx: _make_deferred_reads_replacer(),
+        after=("remote",),
+    ),
+)
+
+
+@tracer.start_as_current_span("_transform_expr")
+def _transform_expr(
+    expr: ir.Expr, params: dict | None = None, **kwargs: Any
+) -> tuple[ir.Expr, RemoteTableScope]:
+    """Transform an expression for execution, binding any named scalar parameters.
+
+    Returns ``(expr, scope)``. One scope, created up front and carried in the
+    ``TransformCtx``, owns every resource the effectful passes materialize
+    (upstream readers, StreamCaches, placeholder tables); the caller must close
+    it once the transformed expr is consumed. Because all passes adopt into that
+    *same* scope, a failure in any pass tears down what *earlier* passes created
+    -- not just its own. The driver (``run_transform_passes``) selects each
+    pass's traversal from its record and asserts the ``after`` ordering.
+    """
+    ctx = TransformCtx(
+        scope=RemoteTableScope(),
+        name_values=_resolve_params(params),
+        read_record_batches_kwargs=kwargs,
+    )
+    try:
+        expr = run_transform_passes(expr, _PASSES, ctx)
+    except BaseException:
+        ctx.scope.close()
+        raise
+    return (expr, ctx.scope)
+
+
+@contextmanager
+def remote_table_scope(expr: ir.Expr, **kwargs: Any) -> Generator[ir.Expr]:
+    """Transform ``expr`` and yield it with a guaranteed full scope close.
+
+    For eager call sites only: the body must fully materialize the result
+    before exiting (placeholder tables are dropped on exit).
+
+    Drain (write-through) failures are surfaced only when the body returns
+    normally: a successful query whose tee/WAP write failed is a correctness
+    error worth raising. If the body itself raised, that exception propagates
+    and drain failures are swallowed so they cannot mask the original error.
+    """
+    (expr, scope) = _transform_expr(expr, **kwargs)
+    try:
+        yield expr
+    except BaseException:
+        scope.close()
+        raise
+    else:
+        scope.close(raise_drain_errors=True)
+
+
+def _flight_to_rbr(
+    expr: ir.Expr, params: dict | None = None, **read_kwargs: Any
+) -> pa.RecordBatchReader:
+    """The Flight execution boundary, routed through the transform discipline.
+
+    A bare ``FlightExpr``/``FlightUDXF`` root is a childless physical-table view,
+    so the effectful BOUNDARY passes no-op on it and the scope comes back empty --
+    but the DESCEND passes must still run: ``to_rbr`` re-enters
+    ``input_expr.to_pyarrow_batches()`` with no ``params``, so binding here is what
+    resolves a parameter living inside ``input_expr`` (and strips its tags). We
+    still dispatch via ``to_rbr`` (a FlightExpr has no normal backend), tie the
+    (empty) scope to the reader, and instrument it -- exactly as the non-Flight
+    path does.
+    """
+    expr, scope = _transform_expr(expr, params=params, **read_kwargs)
+    try:
+        reader = expr.op().to_rbr()
+    except Exception:
+        scope.close()
+        raise
+    return otel_instrument_reader(bind_scope_to_reader(scope, reader))
+
+
+def _pandas_execute(con: BaseBackend, expr: ir.Expr, **kwargs: Any) -> "pd.DataFrame":
+    span = get_current_span()
+
+    node = expr.op()
+    params = kwargs.pop("params", None)
+    if isinstance(node, (FlightExpr, FlightUDXF)):
+        span.set_attribute("engine", "flight")
+        reader = _flight_to_rbr(expr, params=params)
+        df = reader.read_pandas(timestamp_as_object=True)
+        return expr.__pandas_result__(df)
+
+    span.set_attribute("engine", "pandas")
+    # full close is safe here: con.execute returns a materialized DataFrame
+    with remote_table_scope(expr, params=params) as expr:
+        return con.execute(expr, **kwargs)
+
+
+@tracer.start_as_current_span("to_pyarrow_batches")
+def to_pyarrow_batches(
+    expr: ir.Expr,
+    *,
+    chunk_size: int = 1_000_000,
+    **kwargs: Any,
+):
+    """Execute expression and return a RecordBatchReader.
+
+    This method is eager and will execute the associated expression
+    immediately.
+
+    The returned reader must be **fully consumed**: drain threads are joined
+    and temp tables are dropped only after the last batch is read. Consuming
+    partially (an early ``break``) or discarding the reader leaks those
+    resources. Drain failures are surfaced when the reader is exhausted.
+
+    Parameters
+    ----------
+    chunk_size
+        Maximum number of rows in each returned record batch.
+    kwargs
+        Keyword arguments
+
+    Returns
+    -------
+    results
+        RecordBatchReader
+    """
+
+    span = get_current_span()
+
+    params = kwargs.pop("params", None)
+    if isinstance(expr.op(), (FlightExpr, FlightUDXF)):
+        span.set_attribute("engine", "flight")
+        # chunk_size does not apply to to_rbr; kwargs carry no read kwargs here.
+        return _flight_to_rbr(expr, params=params)
+    expr, scope = _transform_expr(expr, params=params)
+    try:
+        con, _ = find_backend(expr.op(), use_default=True)
+        span.set_attribute("engine", con.name)
+        reader = con.to_pyarrow_batches(expr, chunk_size=chunk_size, **kwargs)
+    except Exception:
+        scope.close()
+        raise
+
+    # cleanup stays deferred to the result reader's exhaustion/collection:
+    # the backends scan the placeholders lazily while the reader drains
+    return otel_instrument_reader(bind_scope_to_reader(scope, reader))
+
+
+def to_pyarrow(expr: ir.Expr, **kwargs: Any):
+    """Execute expression and return results in as a pyarrow table.
+
+    This method is eager and will execute the associated expression
+    immediately.
+
+    Parameters
+    ----------
+    kwargs
+        Keyword arguments
+
+    Returns
+    -------
+    Table
+        A pyarrow table holding the results of the executed expression.
+    """
+    batch_reader = to_pyarrow_batches(expr, **kwargs)
+    arrow_table = batch_reader.read_all()
+    return expr.__pyarrow_result__(arrow_table)
+
+
+def to_pyarrow_stream(
+    expr: ir.Expr,
+    sink: Any,
+    params: Mapping[ir.Scalar, Any] | None = None,
+    chunk_size: int | None = None,
+    **kwargs: Any,
+):
+    batch_kwargs = {"chunk_size": chunk_size} if chunk_size is not None else {}
+    rbr = expr.to_pyarrow_batches(params=params, **batch_kwargs)
+    with maybe_open(sink, "wb") as fh:
+        try:
+            writer = pa.ipc.new_stream(fh, rbr.schema, **kwargs)
+            for batch in rbr:
+                writer.write_batch(batch)
+        finally:
+            writer.close()
+
+
+def to_parquet(
+    expr: ir.Expr,
+    path: str | Path,
+    params: Mapping[ir.Scalar, Any] | None = None,
+    **kwargs: Any,
+):
+    """Write the results of executing the given expression to a parquet file.
+
+    This method is eager and will execute the associated expression
+    immediately.
+
+    See https://arrow.apache.org/docs/python/generated/pyarrow.parquet.ParquetWriter.html for details.
+
+    Parameters
+    ----------
+    path
+        A string or Path where the Parquet file will be written.
+    params
+        Mapping of scalar parameter expressions to value.
+    **kwargs
+        Additional keyword arguments passed to pyarrow.parquet.ParquetWriter
+
+    Examples
+    --------
+    Write out an expression to a single parquet file.
+
+    >>> import ibis
+    >>> import tempfile
+    >>> penguins = ibis.examples.penguins.fetch()
+    >>> penguins.to_parquet(tempfile.mktemp())
+    """
+    import pyarrow  # noqa: F401, ICN001, PLC0415
+    import pyarrow.parquet as pq  # noqa: PLC0415
+
+    with to_pyarrow_batches(expr, params=params) as batch_reader:
+        with pq.ParquetWriter(path, batch_reader.schema, **kwargs) as writer:
+            for batch in batch_reader:
+                writer.write_batch(batch)
+
+
+def to_csv(
+    expr: ir.Expr,
+    path: str | Path,
+    params: Mapping[ir.Scalar, Any] | None = None,
+    **kwargs: Any,
+):
+    """Write the results of executing the given expression to a CSV file.
+
+    This method is eager and will execute the associated expression
+    immediately.
+
+    Parameters
+    ----------
+    path
+        The data source. A string or Path to the CSV file.
+    params
+        Mapping of scalar parameter expressions to value.
+    **kwargs
+        Additional keyword arguments passed to pyarrow.csv.CSVWriter
+
+    https://arrow.apache.org/docs/python/generated/pyarrow.csv.CSVWriter.htmlditional keyword arguments passed to pyarrow.csv.CSVWriter
+    """
+
+    import pyarrow  # noqa: F401, ICN001, PLC0415
+    import pyarrow.csv as pcsv  # noqa: PLC0415
+
+    with pcsv.CSVWriter(path, schema=expr.schema().to_pyarrow(), **kwargs) as writer:
+        with to_pyarrow_batches(expr, params=params) as batch_reader:
+            for batch in batch_reader:
+                writer.write_batch(batch)
+
+
+def to_json(
+    expr: ir.Expr,
+    path: str | Path | TextIOWrapper,
+    params: Mapping[ir.Scalar, Any] | None = None,
+):
+    """Write the results of `expr` to a NDJSON file.
+
+    This method is eager and will execute the associated expression
+    immediately.
+
+    Parameters
+    ----------
+    path
+        The data source. A string or Path to the Delta Lake table.
+    **kwargs
+        Additional, backend-specific keyword arguments.
+
+    https://github.com/ndjson/ndjson-spec
+    """
+    with maybe_open(path, "w") as f:
+        with to_pyarrow_batches(expr, params=params) as batch_reader:
+            for batch in batch_reader:
+                df = batch.to_pandas()
+                batch_json = df.to_json(orient="records", lines=True)
+                f.write(batch_json)
+
+
+def get_plans(expr: ir.Expr) -> dict:
+    # Strip tee nodes first (like to_sql): EXPLAIN is a non-executing path, so
+    # it must not register a pass-through table or fire the side-effect write.
+    # Full close is safe here: EXPLAIN is materialized via to_pandas inside.
+    with remote_table_scope(_remove_tee_nodes(expr)) as _expr:
+        con, _ = find_backend(_expr.op())
+        sql = f"EXPLAIN {to_sql(_expr)}"
+        return con.con.sql(sql).to_pandas().set_index("plan_type")["plan"].to_dict()
+
+
+def get_object_metadata(path: str, **kwargs: Any) -> dict:
+    from xorq.config import default_backend  # noqa: PLC0415
+
+    con = default_backend()
+
+    suffix = extract_suffix(path).lstrip(".")
+
+    if "storage_options" in kwargs:
+        kwargs["storage_options"] = dict(kwargs.pop("storage_options"))
+
+    return con.con.get_object_metadata(path, suffix, **kwargs)
+
+
+def param(name: str, dtype, default=_MISSING) -> "ir.Scalar":
+    """Create a named scalar parameter for use in parameterized expressions.
+
+    Parameters
+    ----------
+    name
+        Human-readable label for the parameter (e.g. ``"cutoff"``).
+    dtype
+        ibis data type for the parameter, e.g. ``"float64"``, ``"date"``,
+        ``dt.timestamp()``.
+    default
+        Optional default Python value used when the parameter is not supplied
+        at execution time (e.g. ``0.5``, ``datetime.date(2024, 1, 1)``).
+
+    Returns
+    -------
+    ir.Scalar
+        A scalar expression backed by a :class:`NamedScalarParameter` node.
+        Pass it to :meth:`execute` via ``params={param_expr: value}``.
+
+    Examples
+    --------
+    >>> import xorq as xo
+    >>> cutoff = xo.param("cutoff", "date")
+    >>> threshold = xo.param("threshold", "float64", default=0.5)
+    >>> t = xo.memtable({"d": ["2024-01-01", "2024-06-01"], "v": [1, 2]})
+    """
+    dtype = dt.dtype(dtype)
+    return NamedScalarParameter(dtype=dtype, label=name, default=default).to_expr()
+
+
+def bind_params(expr, params: dict) -> "ir.Expr":
+    """Bind named parameters by name→value dict, applying defaults for omitted ones.
+
+    Parameters
+    ----------
+    expr
+        Expression containing :class:`NamedScalarParameter` nodes.
+    params
+        Mapping of parameter name to Python value.
+    Raises
+    ------
+    ValueError
+        If any required parameter (no default) is absent from *params*.
+    TypeError
+        If *params* contains names not found in *expr*, or values
+        incompatible with the declared dtype.
+    """
+    op_params = _resolve_bind_op_params(expr, params)
+    return replace_nodes(_make_bind_params_replacer(op_params), expr).to_expr()
+
+
+def _resolve_bind_op_params(expr: ir.Expr, params: dict) -> dict:
+    """Validate ``params`` against ``expr``'s NamedScalarParameters and return the
+    ``{node: value}`` bindings (applying defaults for omitted ones).
+
+    Raises the same TypeError/ValueError as ``bind_params`` on extra names,
+    incompatible values, or missing required params.
+    """
+    named = {node.label: node for node in walk_nodes(NamedScalarParameter, expr)}
+
+    errors = []
+
+    inapplicable = tuple(sorted(set(params) - set(named)))
+    if inapplicable:
+        errors.append(f"Got unexpected extra parameter: {', '.join(inapplicable)}")
+
+    for name, value in params.items():
+        if name in named and not dt.infer(value).castable(named[name].dtype):
+            errors.append(
+                f"Parameter {name!r}: value {value!r} (inferred {dt.infer(value)}) "
+                f"is not compatible with declared dtype {named[name].dtype}"
+            )
+
+    if errors:
+        raise TypeError("\n".join(errors))
+
+    missing = tuple(
+        f"{name} ({node.dtype})"
+        for name, node in named.items()
+        if name not in params and node.default is _MISSING
+    )
+    if missing:
+        raise ValueError(f"Missing required parameters: {', '.join(missing)}")
+
+    return {
+        node: params.get(name, node.default)
+        for name, node in named.items()
+        if params.get(name, node.default) is not _MISSING
+    }
+
+
+def _make_bind_params_replacer(op_params: dict) -> Replacer:
+    """Build the DESCEND replacer that substitutes bound NamedScalarParameters
+    with their Literal values."""
+
+    def replacer(node, kwargs):
+        if kwargs:
+            node = node.__recreate__(kwargs)
+        if isinstance(node, NamedScalarParameter) and node in op_params:
+            return ops.Literal(value=op_params[node], dtype=node.dtype)
+        return node
+
+    return replacer

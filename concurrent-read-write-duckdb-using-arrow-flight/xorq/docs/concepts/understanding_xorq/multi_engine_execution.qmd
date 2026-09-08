@@ -1,0 +1,48 @@
+---
+title: 'Multi-Engine'
+---
+
+Move data between different engines within a single expression using `into_backend()`.
+
+```{python}
+import xorq.api as xo
+
+# Connect to engines
+pg = xo.postgres.connect_env()
+db = xo.duckdb.connect()
+
+# Load data from different sources
+batting = pg.table("batting")
+awards = xo.examples.awards_players.fetch(backend=db)
+
+# Filter in respective engines
+recent = batting.filter(batting.yearID == 2015)
+nl_awards = awards.filter(awards.lgID == "NL")
+
+# Move data to postgres for join
+result = recent.join(
+    nl_awards.into_backend(pg),
+    ["playerID"]
+)
+
+result.execute()
+```
+
+### Key features
+
+* **Zero-copy transfers** using Apache Arrow
+* **Automatic optimization** of data placement
+* **Transparent movement** between any supported engines
+
+### When to use
+
+* **Leverage engine strengths** - Use DuckDB for local analysis, Postgres for joins
+* **Combine data sources** - Join tables from different databases
+* **Optimize performance** - Move small tables to where large tables live
+
+## See also
+
+- [Route a step to a specific backend](/how_to/switch_backends.qmd)—use `into_backend()` to place each step on the right engine.
+- [Switch between backends](/getting_started/switch_backends.qmd)—a tutorial introduction to the same machinery.
+- [`Table.into_backend`](/reference/Table.qmd#xorq.vendor.ibis.expr.types.relations.Table.into_backend)—the API that moves a step across engines.
+- [Caching](/concepts/understanding_xorq/intelligent_caching_system.qmd)—cache the transferred result so the move doesn't repeat.

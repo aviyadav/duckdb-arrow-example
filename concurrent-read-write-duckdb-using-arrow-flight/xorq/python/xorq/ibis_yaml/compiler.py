@@ -1,0 +1,1067 @@
+from __future__ import annotations
+
+import contextlib
+import functools
+import json
+import operator
+import pathlib
+import shutil
+import sys
+import warnings
+from pathlib import Path
+from typing import Any, Callable, Dict
+
+import toolz
+import yaml12
+from attr import (
+    evolve,
+    field,
+    frozen,
+)
+from attr.validators import (
+    instance_of,
+    is_callable,
+    optional,
+    or_,
+)
+
+import xorq
+import xorq.vendor.ibis as ibis
+import xorq.vendor.ibis.expr.types as ir
+from xorq.caching import (
+    ParquetCache,
+    ParquetSnapshotCache,
+    ParquetTTLSnapshotCache,
+    SnapshotStrategy,
+)
+from xorq.common.compat import StrEnum
+from xorq.common.constants import REMOTE_SCHEMES
+from xorq.common.exceptions import UnboundExpressionError
+from xorq.common.utils.caching_utils import get_xorq_cache_dir
+from xorq.common.utils.dasher import tokenize
+from xorq.common.utils.defer_utils import (
+    relocatable_read_path,
+    relocatable_read_path_str,
+)
+from xorq.common.utils.file_utils import (
+    normalize_read_path_md5sum,
+    normalize_read_path_stat,
+)
+from xorq.common.utils.graph_utils import (
+    exclusively_pinned_leaves,
+    find_all_sources,
+    opaque_ops,
+    replace_nodes,
+    replace_sources,
+    walk_nodes,
+)
+from xorq.common.utils.name_utils import get_uid_prefix
+from xorq.common.utils.node_utils import (
+    change_read_table_name,
+    recreate,
+    update_read_kwargs,
+)
+from xorq.config import default_backend
+from xorq.expr.api import deferred_read_parquet
+from xorq.expr.operations import _MISSING
+from xorq.expr.relations import (
+    CachedNode,
+    CacheTag,
+    Read,
+    relocate_cache,
+    relocate_cache_tag,
+)
+from xorq.ibis_yaml.common import (
+    Registry,
+    TranslationContext,
+    translate_from_yaml,
+    translate_to_yaml,
+)
+from xorq.ibis_yaml.config import config
+from xorq.ibis_yaml.enums import (
+    BundledSourceTypes,
+    DumpFiles,
+    ExprKind,
+    RefEnum,
+    RegistryEnum,
+    WritePhase,
+)
+from xorq.ibis_yaml.sql import find_relations, generate_sql_plans
+from xorq.ibis_yaml.utils import freeze
+from xorq.vendor.ibis.backends.profiles import Profile
+from xorq.vendor.ibis.common.collections import FrozenOrderedDict
+from xorq.vendor.ibis.expr.operations import DatabaseTable, InMemoryTable
+from xorq.vendor.ibis.expr.types.core import ExprMetadata, SqlQueries
+
+
+@functools.cache
+def _ensure_translate_registered():
+    import xorq.ibis_yaml.translate  # noqa: PLC0415, F401
+
+
+memory_backends = ("pandas", "duckdb", "datafusion", "xorq_datafusion")
+table_like_ops = tuple(o for o in opaque_ops if issubclass(o, DatabaseTable))
+
+
+def _is_relocatable_candidate(node: Any) -> bool:
+    """Local-file Read that has not yet been marked ``relocatable``."""
+    if not isinstance(node, Read):
+        return False
+    kw = dict(node.read_kwargs)
+    if kw.get("relocatable", False):
+        return False
+    hash_path = kw.get("hash_path")
+    if hash_path is None:
+        return False
+    return not str(hash_path).startswith(REMOTE_SCHEMES)
+
+
+def _is_relocatable_read(node: Any) -> bool:
+    """Return True if *node* is a Read already marked ``relocatable``."""
+    if not isinstance(node, Read):
+        return False
+    return any(k == "relocatable" and v for k, v in node.read_kwargs)
+
+
+def _prepare_relocatable_reads(expr: ir.Expr, *, mark: bool) -> ir.Expr:
+    """Mark local-file reads relocatable and bake their bundled ``read_path`` in.
+
+    One pre-hash pass (before ``canonicalize_expr``): ``read_path`` is normally
+    injected by the write phase, which is too late for the build hash, so a fresh
+    build would be named differently from every later load+rebuild. Baking the
+    content-derived ``read_path`` here -- it equals the write-phase value exactly
+    -- keeps a relocated build load+rebuild hash-stable.
+
+    ``mark`` (i.e. ``--relocate-reads``) flips local-file candidates to
+    ``relocatable=True``; reads already relocatable (e.g.
+    ``deferred_read_parquet(relocatable=True)``) get ``read_path`` baked whether
+    or not ``mark`` is set. Note this pass only ever *adds* relocation: there is
+    deliberately no un-marking branch, because relocation is lossy -- it replaces
+    a read's original path with a content hash, so once relocated the source
+    location is gone and ``mark=False`` cannot recover a lean, machine-local read.
+    When ``mark=True``, pinned cache reads (exclusively under a ``CacheTag``) are
+    bundled into the build alongside regular reads, making the pinned artifact
+    self-contained. When ``mark=False``, pinned reads are skipped and remain
+    portable via ``base_path`` relocation (``relocate_cache_tag``). DAG-shared
+    reads also live on a non-pinned branch, so they are not exclusively pinned
+    and are always marked.
+    """
+    if not mark:
+        # mark=False never *marks* reads relocatable; it only bakes read_path into
+        # reads that are already relocatable but haven't had it baked yet. If none
+        # qualify, the pass is a structural no-op, so skip both the pinned-leaf
+        # walk and the full replace_nodes rebuild. This is the hot
+        # relocate_reads=False path -- every fuse/bind and Catalog.add build hits
+        # it, and the vast majority carry no already-relocatable reads. (The scan
+        # spans all reads, including pinned ones the rebuild would skip; that only
+        # ever makes us do a no-op rebuild we could have skipped, never skip a
+        # bake that was needed.)
+        if not any(
+            _is_relocatable_read(node) and "read_path" not in dict(node.read_kwargs)
+            for node in walk_nodes(Read, expr)
+        ):
+            return expr
+    pinned = frozenset() if mark else exclusively_pinned_leaves(expr, (Read,))
+
+    def _relocate(node, kwargs):
+        if isinstance(node, Read) and node not in pinned:
+            kw = dict(node.read_kwargs)
+            marking = mark and _is_relocatable_candidate(node)
+            baking = _is_relocatable_read(node) and "read_path" not in kw
+            if marking or baking:
+                # Internal invariant (not user input): make_read_kwargs sets
+                # hash_path for every path-based read, and a relocatable read is
+                # always path-based, so absence means a malformed / hand-built node.
+                assert "hash_path" in kw, "relocatable Read must have hash_path"
+                read_kwargs = node.read_kwargs
+                overrides = {}
+                if marking:
+                    read_kwargs += (("relocatable", True),)
+                    overrides["normalize_method"] = normalize_read_path_md5sum
+                read_kwargs = update_read_kwargs(
+                    read_kwargs,
+                    (("read_path", relocatable_read_path_str(kw["hash_path"])),),
+                )
+                # Read is a graph leaf, so replace_nodes passes empty kwargs here
+                # and recreate can override the node's own args directly.
+                return recreate(node, read_kwargs=read_kwargs, **overrides)
+        return node.__recreate__(kwargs) if kwargs else node
+
+    op = replace_nodes(_relocate, expr.op())
+    return op.to_expr()
+
+
+def _to_yaml_safe(data):
+    if isinstance(data, (RefEnum, RegistryEnum)):
+        return data.name
+    elif isinstance(data, FrozenOrderedDict):
+        return _to_yaml_safe(dict(data))
+    elif isinstance(data, ibis.Schema):
+        return {name: str(dtype) for name, dtype in zip(data.names, data.types)}
+    elif isinstance(data, (pathlib.PurePath, StrEnum)):
+        return str(data)
+    elif isinstance(data, dict):
+        return {k: _to_yaml_safe(v) for k, v in data.items()}
+    elif isinstance(data, (list, tuple)):
+        return [_to_yaml_safe(v) for v in data]
+    return data
+
+
+@frozen
+class ArtifactStore:
+    root_path = field(validator=instance_of(Path), converter=Path)
+
+    def __attrs_post_init__(self):
+        self.root_path.mkdir(parents=True, exist_ok=True)
+
+    def get_path(self, *parts) -> pathlib.Path:
+        return self.root_path.joinpath(*parts)
+
+    def _read(self, read_f, *parts):
+        path = self.get_path(*parts)
+        with path.open("r") as f:
+            return read_f(f)
+
+    def read_yaml(self, *path_parts) -> Dict[str, Any]:
+        return yaml12.read_yaml(self.get_path(*path_parts))
+
+    def read_json(self, *path_parts) -> Dict[str, Any]:
+        return self._read(json.load, *path_parts)
+
+    def read_text(self, *path_parts) -> str:
+        return self._read(operator.methodcaller("read"), *path_parts)
+
+    @contextlib.contextmanager
+    def _write(self, *path_parts):
+        path = self.get_path(*path_parts)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w") as f:
+            yield (path, f)
+
+    def write_yaml(self, data: Dict[str, Any], *path_parts) -> pathlib.Path:
+        with self._write(*path_parts) as (path, _):
+            yaml12.write_yaml(_to_yaml_safe(data), path)
+        return path
+
+    def write_text(self, content: str, *path_parts) -> pathlib.Path:
+        with self._write(*path_parts) as (path, f):
+            f.write(content)
+        return path
+
+    def write_parquet(self, table, *path_parts) -> pathlib.Path:
+        import pyarrow.parquet as pq  # noqa: PLC0415
+
+        with self._write(*path_parts) as (path, f):
+            pq.write_table(table, path)
+        return path
+
+    def copy_file(self, source: pathlib.Path, *path_parts: str) -> pathlib.Path:
+        dest = self.get_path(*path_parts)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        # rebuilding a relocated build into its own builds_dir can resolve a
+        # bundled read's source to the very dest it would write (e.g. a no-op
+        # pin, now that relocated builds are hash-stable); copy2 would raise
+        # SameFileError, so skip the self-copy.
+        if dest.exists() and source.resolve() == dest.resolve():
+            return dest
+        shutil.copy2(source, dest)
+        return dest
+
+    def exists(self, *path_parts) -> bool:
+        return self.get_path(*path_parts).exists()
+
+    def write_json(self, data: Dict[str, Any], *path_parts) -> pathlib.Path:
+        return self.write_text(json.dumps(data, indent=2), *path_parts)
+
+    def save_yaml(self, yaml_dict: Dict[str, Any], filename) -> pathlib.Path:
+        return self.write_yaml(yaml_dict, filename)
+
+    def load_yaml(self, filename) -> Dict[str, Any]:
+        return self.read_yaml(filename)
+
+    @staticmethod
+    def get_expr_hash(expr) -> str:
+        from xorq.common.utils.provenance_utils import (  # noqa: PLC0415
+            get_expr_hash,
+        )
+
+        return get_expr_hash(expr)
+
+    @classmethod
+    def from_path_and_expr(cls, builds_dir, expr):
+        return cls(root_path=builds_dir.joinpath(cls.get_expr_hash(expr)))
+
+
+class YamlExpressionTranslator:
+    @staticmethod
+    def to_yaml(expr: ir.Expr, profiles=(), cache_dir=None) -> Dict[str, Any]:
+        _ensure_translate_registered()
+        context = TranslationContext(
+            profiles=freeze(dict(profiles)),
+            cache_dir=cache_dir,
+        )
+        with SnapshotStrategy().normalization_context(expr):
+            expr_dict = translate_to_yaml(expr, context)
+            expr_dict = freeze(
+                expr_dict
+                | {
+                    RefEnum.schema_ref: context.registry.register_schema(expr.schema())
+                    if hasattr(expr, "schema")
+                    else None,
+                }
+            )
+            return freeze(
+                {
+                    "definitions": context.definitions,
+                    "expression": expr_dict,
+                }
+            )
+
+    @staticmethod
+    def from_yaml(
+        yaml_dict: Dict[str, Any],
+        profiles=(),
+    ) -> ir.Expr:
+        _ensure_translate_registered()
+        context = TranslationContext(
+            registry=Registry(**yaml_dict.get("definitions", {})),
+            profiles=freeze(dict(profiles)),
+        )
+        expr_dict = freeze(yaml_dict["expression"])
+        return translate_from_yaml(expr_dict, context)
+
+
+def _clone_backend_with_profile(backend, profile):
+    """Shallow-copy a backend and assign a new profile.
+
+    Some backends (xorq, duckdb) have a ``.con`` that holds the
+    underlying connection engine with registered tables and UDFs.
+    ``copy()`` may not share this by reference (e.g. ``do_connect`` is
+    re-invoked), so we explicitly assign it to ensure the clone sees
+    the same session state as the original.
+    """
+    from copy import copy  # noqa: PLC0415
+
+    cloned = copy(backend)
+    cloned._profile = profile
+    if hasattr(backend, "con"):
+        cloned.con = backend.con
+    return cloned
+
+
+def _sanitize_generated_names(expr, normalize_method):
+    """Replace auto-generated InMemoryTable/Read names with content-based names."""
+    # InMemoryTable and Read are independent leaf nodes: renaming one cannot
+    # affect the other, so a single walk collecting both is equivalent to
+    # the previous two sequential walks.
+    replacements = {}
+    # Leave alone the leaves a pin's cache-key token already represents (those
+    # exclusively under a CacheTag); sanitizing them would stat a possibly-
+    # absent upstream source. DAG-shared leaves stay live -- see
+    # exclusively_pinned_leaves, shared with _decompose_expr.
+    pinned_leaves = exclusively_pinned_leaves(expr, (InMemoryTable, Read))
+    for node in walk_nodes((InMemoryTable, Read), expr):
+        if node in pinned_leaves:
+            continue
+        if isinstance(node, InMemoryTable):
+            if prefix := get_uid_prefix(node.name):
+                name = f"{prefix}{tokenize(recreate(node, name='name').to_expr())}"
+                replacements[node] = recreate(
+                    node, name=name, normalize_method=normalize_method
+                )
+        else:
+            if prefix := get_uid_prefix(node.name):
+                # relocatable reads keep their md5sum method; path-less reads
+                # (no hash_path, e.g. API-backed) keep their registered
+                # source-identity method -- the dumper-wide default is a
+                # path normalizer and cannot apply to them
+                read_nm = (
+                    node.normalize_method
+                    if (
+                        _is_relocatable_read(node)
+                        or "hash_path" not in dict(node.read_kwargs)
+                    )
+                    else normalize_method
+                )
+                table_name = f"{prefix}{tokenize(recreate(node, name='name', normalize_method=read_nm).to_expr())}"
+                replacements[node] = recreate(
+                    change_read_table_name(node, table_name=table_name),
+                    normalize_method=read_nm,
+                )
+    op = expr.op()
+    if replacements:
+        op = replace_nodes(replace_from_mapping(replacements), op)
+    return op.to_expr()
+
+
+def canonicalize_expr(expr, read_normalize_method=normalize_read_path_stat):
+    """Single normalization pass: deterministic names and canonical profile IDs.
+
+    Both the YAML serialization path (ExprDumper) and the hashing path
+    (xorq.common.utils.dasher.tokenize) should operate on a canonicalized expression so
+    that build hashes are stable across sessions.
+    """
+    expr = _sanitize_generated_names(expr, read_normalize_method)
+    expr = normalize_profiles(expr)
+    return expr
+
+
+def profile_content_key(profile: Profile) -> str:
+    """Content-only identity of a `Profile`, ignoring the session-local `idx`.
+
+    Shared by every place that needs to tell whether two `Profile`s describe
+    the same underlying connection regardless of which session constructed
+    them: `normalize_profiles` (canonical `idx` ordering), `hydrate_cons`
+    (connection cache keying), and `combine._rebind_same_profile_sources`
+    (same-profile backend rebinding). Delegates to `Profile.content_hash`,
+    which also backs `hash_name` -- one computation, not two.
+    """
+    return profile.content_hash
+
+
+def normalize_profiles(expr):
+    """Rewrite the expression graph so Profile.idx values are canonical.
+
+    Session-global sequential IDs (Profile.idx) leak into hash_name, YAML,
+    and the build hash.  This function sorts profiles by their content-only
+    hash (idx excluded) and assigns idx = 0, 1, 2, … in that order.
+
+    Returns a **new** expression with cloned backends whose ``con`` is
+    shared with the originals — the original expression and its backends
+    are not mutated.
+    """
+    backends = find_all_sources(expr)
+    if not backends:
+        return expr
+
+    def content_key(backend):
+        return profile_content_key(
+            backend._profile  # xorq-style: disable=protected-access
+        )
+
+    # sort by content hash → deterministic canonical order
+    # Python sort is stable so backends with the same content hash
+    # preserve their discovery order from find_all_sources
+    sorted_backends = sorted(backends, key=content_key)
+
+    # build id(old_backend) → cloned_backend mapping
+    source_mapping = {}
+    for canonical_idx, backend in enumerate(sorted_backends):
+        if backend._profile.idx != canonical_idx:
+            canonical_profile = backend._profile.clone(idx=canonical_idx)
+            source_mapping[id(backend)] = _clone_backend_with_profile(
+                backend, canonical_profile
+            )
+
+    if not source_mapping:
+        return expr
+
+    return replace_sources(source_mapping, expr)
+
+
+def dehydrate_cons(cons):
+    dehydrated = dict(
+        sorted(
+            (
+                profile.hash_name,
+                profile.as_dict()
+                | {
+                    "kwargs_tuple": dict(profile.as_dict()["kwargs_tuple"]),
+                },
+            )
+            for profile in (con._profile for con in cons)
+        )
+    )
+    return dehydrated
+
+
+def hydrate_cons(
+    hash_to_profile_kwargs: dict, lazy: bool = False, con_cache: dict | None = None
+) -> dict:
+    """Reconstruct connections from their dumped profile kwargs.
+
+    con_cache : dict[str, BaseBackend] | None
+        When given, connections are shared across calls by profile *content*
+        (con_name + kwargs, matching `normalize_profiles`'s own comparison --
+        `idx` is session-local and excluded): a caller loading several builds
+        that share a same-config connection (e.g. `join_builds`/`union_builds`
+        loading each side) gets one connection object per distinct config
+        instead of a fresh one per build, the way a single `load_expr` call
+        already shares one connection across every read in that build. Pass
+        the *same* dict across those calls; leave it `None` (the default) for
+        an unrelated single load, which keeps today's per-call behavior.
+    """
+
+    def kwargs_to_con(kwargs):
+        match dct := dict(kwargs):
+            case {"kwargs_tuple": dict()}:
+                dct["kwargs_tuple"] = tuple(dct["kwargs_tuple"].items())
+            case _:
+                dct["kwargs_tuple"] = tuple(map(tuple, dct["kwargs_tuple"]))
+        profile = Profile(**dct)
+        if con_cache is None:
+            return profile.get_con(lazy=lazy)
+        key = profile_content_key(profile)
+        if key not in con_cache:
+            con_cache[key] = profile.get_con(lazy=lazy)
+        return con_cache[key]
+
+    profiles = toolz.valmap(
+        kwargs_to_con,
+        hash_to_profile_kwargs,
+    )
+    return profiles
+
+
+def make_read_op(parquet_path, read_kwargs, con=None):
+    if con is None:
+        con = default_backend()
+    op = deferred_read_parquet(parquet_path, con, **read_kwargs).op()
+    args = dict(zip(op.__argnames__, op.__args__))
+    op = op.__recreate__(args)
+    return op
+
+
+def _extract_sql_queries(expr: ir.Expr, kind: ExprKind) -> SqlQueries:
+    """Extract (name, engine, sql, relations) tuples from an expression for caching."""
+    from xorq.expr.api import _remove_tag_nodes, bind_params  # noqa: PLC0415
+    from xorq.expr.api import to_sql as xorq_to_sql  # noqa: PLC0415
+    from xorq.expr.operations import NamedScalarParameter  # noqa: PLC0415
+
+    clean = _remove_tag_nodes(expr)
+    # Bind named params to their defaults so SQL generation doesn't see them
+    named = {n.label: n for n in clean.op().find(NamedScalarParameter)}
+    if named:
+        defaults = {
+            label: node.default
+            for label, node in named.items()
+            if node.default is not _MISSING and node.default is not None
+        }
+        if defaults:
+            clean = bind_params(clean, defaults)
+    match kind:
+        case ExprKind.UnboundExpr:
+            sql = str(xorq_to_sql(clean)).strip()
+            return (
+                (("main", "xorq_datafusion", sql, tuple(find_relations(clean))),)
+                if sql
+                else ()
+            )
+        case _:
+            sql_plans, deferred_reads = generate_sql_plans(clean)
+            return tuple(
+                (
+                    name,
+                    info.get("engine", "?"),
+                    info.get("sql", "").strip(),
+                    tuple(info.get("relations", ())),
+                )
+                for mapping in (
+                    sql_plans.get("queries", {}),
+                    deferred_reads.get("reads", {}),
+                )
+                for name, info in mapping.items()
+                if info.get("sql", "").strip()
+            )
+
+
+def _validate_normalize_method(instance: Any, attribute: Any, value: Any) -> None:
+    # lock down: the build-time normalize_method must be serializable by name so
+    # the resulting build loads across xorq versions (#2155).
+    from xorq.ibis_yaml.normalize_registry import validate  # noqa: PLC0415
+
+    validate(value)
+
+
+@frozen
+class WritePlan:
+    """A single deferred write: where, how, when, and whether duplicates are safe.
+
+    dedupable marks content-addressed paths (parquet, SQL files) whose repeated
+    plans always write identical bytes, so dropping duplicates is lossless. Fixed
+    singleton files are not dedupable and colliding on one signals a bug.
+    """
+
+    path = field(validator=instance_of(Path), converter=Path)
+    writer = field(validator=is_callable())
+    phase = field(validator=instance_of(WritePhase))
+    dedupable = field(validator=instance_of(bool), default=False)
+
+    @classmethod
+    def build(
+        cls,
+        artifact_store: "ArtifactStore",
+        write_fn: Callable[..., Path],
+        payload: Any,
+        path_parts: str | tuple[str, ...],
+        *,
+        phase: WritePhase = WritePhase.ARTIFACT,
+        dedupable: bool = False,
+    ) -> "WritePlan":
+        """Build a WritePlan whose path and deferred writer share one path_parts.
+
+        write_fn is an ArtifactStore method taking (payload, *path_parts); binding
+        both the path and the writer to the same parts keeps them from drifting.
+
+        phase defaults to ARTIFACT (order-independent metadata), the common case;
+        content files that the expr YAML tokenizes pass phase=WritePhase.DATA.
+        """
+        parts = path_parts if isinstance(path_parts, tuple) else (path_parts,)
+        path = artifact_store.get_path(*parts)
+        writer = functools.partial(write_fn, payload, *parts)
+        return cls(path, writer, phase, dedupable=dedupable)
+
+
+@frozen
+class ExprDumper:
+    """
+    expr: the expr to be built
+    builds_dir: root directory where expr builds are stored
+    cache_dir: optional directory for parquet cache files
+    debug: when True, output SQL files and debug artifacts (sql.yaml, deferred_reads.yaml)
+    relocate_reads: when True, copy local-file Read sources into the build artifact
+    """
+
+    expr = field(validator=instance_of(ir.Expr))
+    builds_dir = field(validator=instance_of(Path), converter=Path, default="./builds")
+    cache_dir = field(validator=optional(instance_of(Path)), factory=get_xorq_cache_dir)
+    debug = field(validator=instance_of(bool), default=False)
+    # Defaults True to match the CLI: bundle local-file reads so the build is
+    # self-contained. The fuse/bind execute path resolves bundled reads too (the
+    # extract dir is kept alive for the fused expr's lifetime); see #2133.
+    relocate_reads = field(validator=instance_of(bool), default=True)
+    read_normalize_method = field(
+        validator=[is_callable(), _validate_normalize_method],
+        default=normalize_read_path_stat,
+    )
+
+    def __attrs_post_init__(self) -> None:
+        expr = _prepare_relocatable_reads(self.expr, mark=self.relocate_reads)
+        expr = canonicalize_expr(expr, self.read_normalize_method)
+        object.__setattr__(self, "expr", expr)
+        attrname = "cache_dir"
+        match value := getattr(self, attrname):
+            case None:
+                object.__setattr__(self, attrname, get_xorq_cache_dir())
+            case Path():
+                pass
+            case _:
+                object.__setattr__(self, attrname, Path(value))
+
+    @functools.cached_property
+    def artifact_store(self):
+        return ArtifactStore.from_path_and_expr(self.builds_dir, self.expr)
+
+    @functools.cached_property
+    def expr_path(self):
+        return self.artifact_store.root_path
+
+    @property
+    def expr_hash(self):
+        return self.expr_path.name
+
+    def _prepare_expr_file(self, expr: ir.Expr, profiles: dict) -> WritePlan:
+        path = self.artifact_store.get_path(DumpFiles.expr)
+        # phase EXPR: translation tokenizes memtable parquets, which the DATA
+        # phase must have written first
+        writer = toolz.compose(
+            functools.partial(self.artifact_store.save_yaml, filename=DumpFiles.expr),
+            functools.partial(
+                YamlExpressionTranslator.to_yaml,
+                expr,
+                profiles,
+                self.cache_dir,
+            ),
+        )
+        return WritePlan(path, writer, WritePhase.EXPR)
+
+    def _prepare_sql_file(self, sql: str) -> WritePlan:
+        filename = f"{tokenize(sql)[: config.hash_length]}.sql"
+        return WritePlan.build(
+            self.artifact_store,
+            self.artifact_store.write_text,
+            sql,
+            filename,
+            dedupable=True,
+        )
+
+    def _prepare_memtable(
+        self, mt: InMemoryTable | DatabaseTable, which: BundledSourceTypes
+    ) -> WritePlan:
+        assert which in BundledSourceTypes
+        table = mt.to_expr().to_pyarrow()
+        return WritePlan.build(
+            self.artifact_store,
+            self.artifact_store.write_parquet,
+            table,
+            (which, f"{tokenize(table)}.parquet"),
+            phase=WritePhase.DATA,
+            dedupable=True,
+        )
+
+    def _prepare_relocatable_read(self, read_node: Read) -> WritePlan:
+        kw = dict(read_node.read_kwargs)
+        # Internal invariant; see the matching guard in _prepare_relocatable_reads.
+        assert "hash_path" in kw, "relocatable Read must have hash_path"
+        source_path = Path(kw["hash_path"])
+        return WritePlan.build(
+            self.artifact_store,
+            self.artifact_store.copy_file,
+            source_path,
+            relocatable_read_path(source_path),
+            phase=WritePhase.DATA,
+            dedupable=True,
+        )
+
+    def _prepare_sql_bundle(
+        self,
+        mapping: Dict[str, Any],
+        collection_key: str,
+        dump_file: DumpFiles,
+    ) -> tuple[WritePlan, ...]:
+        """Plan one SQL file per entry, plus the index YAML naming those files.
+
+        mapping is name -> info dict carrying a "sql" key; each entry's SQL is
+        spilled to its own content-addressed file and the info is rewritten to
+        reference that file by name under collection_key in dump_file.
+        """
+        items = {}
+        sql_file_plans = []
+        for name, info in mapping.items():
+            plan = self._prepare_sql_file(info["sql"])
+            sql_file_plans.append(plan)
+            items[name] = toolz.dissoc(info, "sql") | {"sql_file": plan.path.name}
+        yaml_plan = WritePlan.build(
+            self.artifact_store,
+            self.artifact_store.write_yaml,
+            {collection_key: items},
+            dump_file,
+        )
+        return (*sql_file_plans, yaml_plan)
+
+    @staticmethod
+    def _make_build_metadata() -> str:
+        import xorq.common.utils.logging_utils as lu  # noqa: PLC0415
+
+        metadata = {
+            "current_library_version": xorq.__version__,
+            "metadata_version": "0.0.0",  # TODO: make it a real thing
+            "git_state": lu.get_git_state(hash_diffs=False)
+            if lu._git_is_present()
+            else None,
+            "sys-version_info": tuple(sys.version_info),
+        }
+        metadata_json = json.dumps(metadata, indent=2)
+        return metadata_json
+
+    def _prepare_build_metadata_file(self) -> WritePlan:
+        return WritePlan.build(
+            self.artifact_store,
+            self.artifact_store.write_text,
+            self._make_build_metadata(),
+            DumpFiles.build_metadata,
+        )
+
+    def _make_expr_metadata(self, expr) -> Dict[str, Any]:
+        from xorq.common.utils.lineage_utils import (  # noqa: PLC0415
+            extract_lineage_dag,
+        )
+
+        metadata = ExprMetadata.from_expr(expr)
+        try:
+            sql_queries = _extract_sql_queries(expr, metadata.kind)
+        except (ValueError, RuntimeError, KeyError) as e:
+            warnings.warn(
+                f"Failed to extract SQL queries for caching: {e}",
+                stacklevel=2,
+            )
+            sql_queries = ()
+        lineage = extract_lineage_dag(expr)
+        metadata = evolve(metadata, sql_queries=sql_queries, lineage=lineage)
+        return metadata.to_dict()
+
+    def _prepare_expr_metadata_file(self, expr: ir.Expr) -> WritePlan:
+        return WritePlan.build(
+            self.artifact_store,
+            self.artifact_store.write_json,
+            self._make_expr_metadata(expr),
+            DumpFiles.expr_metadata,
+        )
+
+    def _prepare_profiles_file(self, profiles: dict) -> WritePlan:
+        return WritePlan.build(
+            self.artifact_store,
+            self.artifact_store.write_yaml,
+            profiles,
+            DumpFiles.profiles,
+        )
+
+    def _prepare_debug_info(self) -> tuple[WritePlan, ...]:
+        sql_plans, deferred_reads = generate_sql_plans(self.expr)
+        return (
+            *self._prepare_sql_bundle(sql_plans["queries"], "queries", DumpFiles.sql),
+            *self._prepare_sql_bundle(
+                deferred_reads["reads"], "reads", DumpFiles.deferred_reads
+            ),
+        )
+
+    def _replace_tables(self, expr):
+        """Single-pass replacement of InMemoryTable and qualifying DatabaseTable nodes.
+
+        Combines what were previously two separate walk_nodes + replace_nodes
+        calls (_memtables_to_deferred_reads and _replace_inmemory_backend_tables)
+        into one graph traversal and one replacement pass.
+        """
+        plans = []
+        replacements = {}
+        for node in walk_nodes((InMemoryTable, DatabaseTable), expr):
+            if isinstance(node, InMemoryTable):
+                which = BundledSourceTypes.inmemory
+                # The `inmemory` marker flags this Read for memtable
+                # reconstruction on load; InMemoryTable data is deterministic,
+                # so content-hash normalization keeps the YAML reproducible
+                # across processes and rebuild timestamps.
+                type_kwargs = {str(which): True}
+                con_kwargs = {}
+            elif _is_relocatable_read(node):
+                plan = self._prepare_relocatable_read(node)
+                # read_path via the single-source-of-truth helper (same one the
+                # pre-hash bake pass uses) so the two stay byte-equal -- that
+                # equality is what keeps a relocated build load+rebuild hash-stable
+                read_path = relocatable_read_path_str(
+                    dict(node.read_kwargs)["hash_path"]
+                )
+                new_kwargs = update_read_kwargs(
+                    node.read_kwargs,
+                    (("hash_path", plan.path), ("read_path", read_path)),
+                )
+                args = dict(zip(node.__argnames__, node.__args__)) | {
+                    "read_kwargs": new_kwargs
+                }
+                plans.append(plan)
+                replacements[node] = node.__recreate__(args)
+                continue
+            elif (
+                isinstance(node, table_like_ops)
+                or node.source.name not in memory_backends
+            ):
+                continue
+            else:
+                which = BundledSourceTypes.database_table
+                type_kwargs = {}
+                con_kwargs = {"con": node.source}
+
+            plan = self._prepare_memtable(node, which)
+            dr_op = make_read_op(
+                parquet_path=plan.path,
+                read_kwargs={
+                    "table_name": node.name,
+                    "schema": node.schema,
+                    **type_kwargs,
+                    "normalize_method": normalize_read_path_md5sum,
+                    "read_path": str(Path(which, plan.path.name)),
+                },
+                **con_kwargs,
+            )
+            plans.append(plan)
+            replacements[node] = dr_op
+        op = expr.op()
+        if replacements:
+            op = replace_nodes(replace_from_mapping(replacements), op)
+        return op.to_expr(), tuple(plans)
+
+    @staticmethod
+    def _execute_write_plans(plans: tuple[WritePlan, ...]) -> None:
+        """Run every plan's writer, sorted by phase, after deduping paths.
+
+        Content-addressed plans (dedupable) may target the same path more than
+        once with byte-identical output, so extra copies are dropped. Any other
+        path collision is a bug and raises rather than silently losing a writer.
+        """
+        by_path = toolz.groupby(operator.attrgetter("path"), plans)
+        conflicts = tuple(
+            f"{keeper.path}: non-dedupable collision "
+            f"(phases {keeper.phase.name}, {other.phase.name})"
+            for (keeper, *rest) in by_path.values()
+            for other in rest
+            if not (keeper.dedupable and other.dedupable)
+        )
+        if conflicts:
+            raise ValueError(
+                "conflicting non-dedupable write plans:\n" + "\n".join(conflicts)
+            )
+        keepers = (keeper for (keeper, *_) in by_path.values())
+        for plan in sorted(keepers, key=operator.attrgetter("phase")):
+            plan.writer()
+
+    def dump_expr(self) -> str:
+        from xorq.ibis_yaml.translate import (  # noqa: PLC0415
+            _ensure_sklearn_to_yaml_registered,
+        )
+
+        _ensure_sklearn_to_yaml_registered()
+
+        # we will mutate the expr below
+        expr = self.expr
+
+        # write in-memory data to build dir (single walk + single replacement pass)
+        expr, data_plans = self._replace_tables(expr)
+
+        profiles = dehydrate_cons(find_all_sources(expr))
+        plans = (
+            *data_plans,
+            self._prepare_expr_metadata_file(self.expr),
+            self._prepare_build_metadata_file(),
+            self._prepare_profiles_file(profiles),
+            # phase ordering guarantees this runs after the DATA parquets exist
+            self._prepare_expr_file(expr, profiles),
+        )
+        if self.debug:
+            # write SQL plan and deferred-read artifacts if debug enabled
+            plans += self._prepare_debug_info()
+        self._execute_write_plans(plans)
+        return self.expr_path
+
+
+@frozen
+class ExprLoader:
+    expr_path = field(validator=instance_of(Path), converter=Path)
+    cache_dir = field(
+        validator=optional(or_(instance_of(Path), instance_of(str))), default=None
+    )
+    # Shared with `hydrate_cons` -- see its docstring. `None` (the default)
+    # keeps this load's connections private to it, matching prior behavior.
+    con_cache = field(validator=optional(instance_of(dict)), default=None)
+
+    @property
+    def expr_hash(self):
+        return self.expr_path.name
+
+    @functools.cached_property
+    def artifact_store(self):
+        return ArtifactStore(self.expr_path)
+
+    def load_expr(
+        self,
+        raise_on_unbound: bool = True,
+        lazy: bool = False,
+        read_only_parquet_metadata: bool = False,
+    ):
+        profiles = hydrate_cons(
+            self.artifact_store.load_yaml(DumpFiles.profiles),
+            lazy=lazy,
+            con_cache=self.con_cache,
+        )
+        yaml_dict = self.artifact_store.load_yaml(DumpFiles.expr)
+        entry = self.artifact_store.read_json(DumpFiles.expr_metadata)
+        if raise_on_unbound and entry.get("kind") == ExprKind.UnboundExpr:
+            raise UnboundExpressionError(
+                "expression is unbound; pass raise_on_unbound=False to load anyway"
+            )
+        expr = YamlExpressionTranslator.from_yaml(yaml_dict, profiles=profiles)
+        expr = self.deferred_reads_to_memtables(
+            expr, self.expr_path, read_only_parquet_metadata=read_only_parquet_metadata
+        )
+        if self.cache_dir:
+            expr = self.replace_base_path(expr, base_path=Path(self.cache_dir))
+        return expr
+
+    @staticmethod
+    def deferred_reads_to_memtables(
+        loaded, expr_path, read_only_parquet_metadata=False
+    ):
+        def resolve_read(dr):
+            kw = dict(dr.read_kwargs)
+            path = expr_path.joinpath(kw["read_path"])
+            if BundledSourceTypes.inmemory in kw:
+                import pyarrow.parquet as pq  # noqa: PLC0415
+
+                df = (
+                    pq.read_schema(path).empty_table().to_pandas()
+                    if read_only_parquet_metadata
+                    else default_backend().read_parquet(path).execute()
+                )
+                return ibis.memtable(df, schema=dr.schema, name=dr.name).op()
+            resolved_kwargs = update_read_kwargs(dr.read_kwargs, (("hash_path", path),))
+            relocatable = kw.get("relocatable", False)
+            args = dict(zip(dr.__argnames__, dr.__args__)) | {
+                "read_kwargs": resolved_kwargs
+            }
+            node = dr.__recreate__(args)
+            return node if relocatable else node.make_dt()
+
+        drs = tuple(
+            dr for dr in walk_nodes(Read, loaded) if "read_path" in dict(dr.read_kwargs)
+        )
+        replacements = {dr: resolve_read(dr) for dr in drs}
+        op = loaded.op()
+        if replacements:
+            op = replace_nodes(replace_from_mapping(replacements), op)
+        return op.to_expr()
+
+    @staticmethod
+    def replace_base_path(expr, base_path):
+        parquet_cache_types = (
+            ParquetCache,
+            ParquetSnapshotCache,
+            ParquetTTLSnapshotCache,
+        )
+
+        # replace_nodes (not op.replace) so the rewrite reaches CachedNodes
+        # nested inside opaque sub-exprs like RemoteTable.remote_expr.
+        def replacer(node, kwargs):
+            cache = getattr(node, "cache", None)
+            if isinstance(node, (CachedNode, CacheTag)) and isinstance(
+                cache, parquet_cache_types
+            ):
+                if isinstance(node, CacheTag):
+                    # A pinned cache is a frozen read; relocate it by re-pointing
+                    # that read at the new base_path (the key is base_path-
+                    # independent), so a pinned build is portable across cache dirs.
+                    return relocate_cache_tag(node, base_path)
+                evolved = relocate_cache(cache, base_path)
+                return recreate(node, **((kwargs or {}) | {"cache": evolved}))
+            return node.__recreate__(kwargs) if kwargs else node
+
+        return replace_nodes(replacer, expr).to_expr()
+
+
+@functools.wraps(ExprLoader)
+def load_expr(expr_path, **kwargs):
+    raise_on_unbound = kwargs.pop("raise_on_unbound", False)
+    lazy = kwargs.pop("lazy", False)
+    read_only_parquet_metadata = kwargs.pop("read_only_parquet_metadata", False)
+    expr_loader = ExprLoader(expr_path, **kwargs)
+    return expr_loader.load_expr(
+        raise_on_unbound=raise_on_unbound,
+        lazy=lazy,
+        read_only_parquet_metadata=read_only_parquet_metadata,
+    )
+
+
+# todo: rename to dump_expr
+@functools.wraps(ExprDumper)
+def build_expr(expr, **kwargs):
+    expr_dumper = ExprDumper(expr, **kwargs)
+    expr_path = expr_dumper.dump_expr()
+    return expr_path
+
+
+@toolz.curry
+def replace_from_to(from_, to_, node, kwargs):
+    if node == from_:
+        return to_
+    elif kwargs:
+        return node.__recreate__(kwargs)
+    else:
+        return node
+
+
+@toolz.curry
+def replace_from_mapping(mapping, node, kwargs):
+    if node in mapping:
+        return mapping[node]
+    elif kwargs:
+        return node.__recreate__(kwargs)
+    else:
+        return node

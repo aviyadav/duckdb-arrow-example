@@ -1,0 +1,9 @@
+[Server - Arrow]
+uv run python examples/duckdb_flight_example.py serve -p 8816 -d multi.db -n test
+
+[Write data]
+uv run python examples/duckdb_flight_example.py write -p 8816 -d multi.db -n test
+
+
+[Read data]
+uv run python examples/duckdb_flight_example.py read -p 8816 -d multi.db -n test

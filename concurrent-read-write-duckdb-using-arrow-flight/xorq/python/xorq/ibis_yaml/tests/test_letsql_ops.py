@@ -1,0 +1,140 @@
+import pytest
+
+import xorq.api as xo
+from xorq.api import _
+from xorq.common.utils.defer_utils import (
+    deferred_read_csv,
+    deferred_read_parquet,
+)
+from xorq.expr.relations import into_backend
+from xorq.ibis_yaml.compiler import YamlExpressionTranslator
+
+
+@pytest.fixture(scope="session")
+def duckdb_path(tmp_path_factory):
+    db_path = tmp_path_factory.mktemp("duckdb") / "test.db"
+    return str(db_path)
+
+
+@pytest.fixture(scope="session")
+def prepare_duckdb_con(duckdb_path):
+    con = xo.duckdb.connect(duckdb_path)
+    con.profile_name = "my_duckdb"  # patch
+
+    con.raw_sql(
+        """
+        CREATE TABLE IF NOT EXISTS mytable (
+            id INT,
+            val VARCHAR
+        )
+        """
+    )
+    con.raw_sql(
+        """
+        INSERT INTO mytable
+        SELECT i, 'val' || i::VARCHAR
+        FROM range(1, 6) t(i)
+        """
+    )
+    return con
+
+
+def test_duckdb_database_table_roundtrip(prepare_duckdb_con):
+    con = prepare_duckdb_con
+    profiles = {con._profile.hash_name: con}
+    table_expr = con.table("mytable")
+
+    expr1 = table_expr.mutate(new_val=(table_expr.val + "_extra"))
+    yaml_dict = YamlExpressionTranslator.to_yaml(expr1, profiles)
+    roundtrip_expr = YamlExpressionTranslator.from_yaml(yaml_dict, profiles)
+
+    df_original = expr1.execute()
+    df_roundtrip = roundtrip_expr.execute()
+
+    assert df_original.equals(df_roundtrip), "Roundtrip expression data differs!"
+
+
+@pytest.mark.xfail(reason="MemTable is not serializable")
+def test_memtable(builds_dir):
+    table = xo.memtable([(i, "val") for i in range(10)], columns=["key1", "val"])
+    backend = table._find_backend()
+    expr = table.mutate(new_val=2 * xo._.val)
+
+    profiles = {backend._profile.hash_name: backend}
+
+    yaml_dict = YamlExpressionTranslator.to_yaml(expr, profiles, builds_dir)
+    roundtrip_expr = YamlExpressionTranslator.from_yaml(yaml_dict)
+
+    expr.equals(roundtrip_expr)
+
+    assert expr.execute().equals(roundtrip_expr.execute())
+
+
+def test_into_backend():
+    parquet_path = xo.config.options.pins.get_path("awards_players")
+    backend = xo.duckdb.connect()
+    table = deferred_read_parquet(parquet_path, backend, table_name="award_players")
+    expr = table.mutate(new_id=2 * xo._.playerID)
+
+    con2 = xo.connect()
+    con3 = xo.connect()
+
+    expr = into_backend(expr, con2, "ls_mem").mutate(x=4 * xo._.new_id)
+    expr = into_backend(expr, con3, "df_mem")
+
+    profiles = {
+        backend._profile.hash_name: backend,
+        con2._profile.hash_name: con2,
+        con3._profile.hash_name: con3,
+    }
+
+    yaml_dict = YamlExpressionTranslator.to_yaml(expr, profiles)
+    roundtrip_expr = YamlExpressionTranslator.from_yaml(yaml_dict, profiles)
+
+    assert xo.execute(expr).equals(xo.execute(roundtrip_expr))
+
+
+def test_read_dedup_preserved_across_remote_tables():
+    parquet_path = xo.config.options.pins.get_path("awards_players")
+    con_a = xo.connect()
+    con_b = xo.connect()
+    target = xo.connect()
+
+    read_a = deferred_read_parquet(parquet_path, con_a)
+    read_b = deferred_read_parquet(parquet_path, con_b)
+    expr = into_backend(read_a, target).union(into_backend(read_b, target))
+
+    profiles = {c._profile.hash_name: c for c in (con_a, con_b, target)}
+    yaml_dict = YamlExpressionTranslator.to_yaml(expr, profiles)
+
+    nodes = dict(yaml_dict["definitions"]["nodes"])
+    read_entries = [dict(v) for k, v in nodes.items() if k.startswith("@read_")]
+    assert len(read_entries) == 2
+    assert read_entries[0]["name"] != read_entries[1]["name"]
+
+
+@pytest.mark.xfail(reason="MemTable is not serializable")
+def test_memtable_cache():
+    table = xo.memtable([(i, "val") for i in range(10)], columns=["key1", "val"])
+    expr = table.mutate(new_val=2 * xo._.val).cache()
+    yaml_dict = YamlExpressionTranslator.to_yaml(expr)
+    roundtrip_expr = YamlExpressionTranslator.from_yaml(yaml_dict)
+
+    assert xo.execute(expr).equals(xo.execute(roundtrip_expr))
+
+
+def test_deferred_read_csv(csv_dir):
+    csv_name = "astronauts"
+    csv_path = csv_dir / f"{csv_name}.csv"
+
+    pd_con = xo.pandas.connect()
+    expr = deferred_read_csv(con=pd_con, path=csv_path, table_name=csv_name).filter(
+        _.id > 6
+    )
+
+    profiles = {pd_con._profile.hash_name: pd_con}
+    with pytest.warns(UserWarning):
+        yaml_dict = YamlExpressionTranslator.to_yaml(expr, profiles)
+        roundtrip_expr = YamlExpressionTranslator.from_yaml(yaml_dict, profiles)
+
+    assert xo.execute(expr).equals(xo.execute(roundtrip_expr))

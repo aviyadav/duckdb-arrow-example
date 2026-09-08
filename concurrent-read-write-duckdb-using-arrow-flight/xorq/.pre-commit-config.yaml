@@ -1,0 +1,48 @@
+ci:
+  autofix_commit_msg: "style: auto fixes from pre-commit.ci hooks"
+  autofix_prs: false
+  autoupdate_commit_msg: "chore(deps): pre-commit.ci autoupdate"
+  skip:
+    - ruff
+default_install_hook_types:
+  - pre-commit
+  - post-checkout
+default_stages:
+  - pre-commit
+repos:
+  - repo: https://github.com/rhysd/actionlint
+    rev: v1.7.12
+    hooks:
+      - id: actionlint
+  - repo: https://github.com/codespell-project/codespell
+    rev: v2.4.2
+    hooks:
+      - id: codespell
+        additional_dependencies:
+          - tomli
+        args: [--ignore-words=.codespell.ignore-words]
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    # Ruff version.
+    rev: v0.15.12
+    hooks:
+      # Run the linter.
+      - id: ruff-check
+        args: ["--output-format=full", "--fix", "python", "examples", "docs", "scripts"]
+      # Run the formatter.
+      - id: ruff-format
+  - repo: https://github.com/astral-sh/uv-pre-commit
+    # uv version.
+    rev: 0.11.8
+    hooks:
+      # Update the uv lockfile
+      - id: uv-lock
+  - repo: local
+    hooks:
+      - id: git-blame-ignore-revs
+        name: configure blame.ignoreRevsFile
+        entry: git config --replace-all blame.ignoreRevsFile .git-blame-ignore-revs
+        language: system
+        stages:
+          - post-checkout
+        always_run: true
+        pass_filenames: false

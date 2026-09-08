@@ -1,0 +1,772 @@
+from __future__ import annotations
+
+from collections import defaultdict, deque
+from collections.abc import Callable, Iterator, Mapping
+from types import MappingProxyType
+from typing import Any, OrderedDict, Tuple
+
+from attrs import field, frozen
+from attrs.validators import deep_iterable, instance_of, optional
+
+import xorq.expr.relations as rel
+import xorq.expr.udf as udf
+import xorq.vendor.ibis.expr.operations as ops
+from xorq.expr.operations import NamedScalarParameter
+from xorq.vendor.ibis import Expr
+from xorq.vendor.ibis.common.graph import Graph
+from xorq.vendor.ibis.expr.operations.core import Node
+
+
+@frozen
+class OpaqueSpec:
+    """Everything graph traversal needs to know about one opaque op type.
+
+    An *opaque* op holds children the standard ``__children__`` protocol does not
+    surface (they are ``Expr``-typed or stored in ``__config__``); the edge fields
+    naming those children, plus the per-op quirks of rewriting them, live here so
+    one entry tells the whole story for one op type.
+    """
+
+    # Edge fields the read side descends (``gen_children_of`` + policy variants).
+    read_edges: Tuple[str, ...] = field(
+        default=(), validator=deep_iterable(instance_of(str))
+    )
+    # Edge fields the write side descends (``replace_nodes``); ``None`` means
+    # "same as read_edges". Set it only where the two genuinely differ.
+    write_edges: Tuple[str, ...] | None = field(
+        default=None, validator=optional(deep_iterable(instance_of(str)))
+    )
+    # Whether ``replace_nodes`` forwards the pre-replacer ``_kwargs`` to
+    # ``__recreate__``.
+    forward_kwargs: bool = field(default=True, validator=instance_of(bool))
+    # For ops whose sub-expression rebinds through a dedicated method rather than
+    # a plain ``__recreate__`` kwarg: ``rebind(op, new_sub_expr) -> op``.
+    rebind: Callable | None = field(
+        default=None, validator=optional(instance_of(Callable))
+    )
+
+    def __attrs_post_init__(self) -> None:
+        # ``replace_nodes`` rebinds by passing the single rewritten sub-expression
+        # to ``rebind``; a multi-edge rebind has no defined call shape. Reject it
+        # here so a bad table entry fails at import time, not mid-traversal.
+        if self.rebind is not None and len(self.descend_edges) != 1:
+            raise ValueError(
+                f"rebind requires exactly one write-side edge, "
+                f"got {self.descend_edges!r}"
+            )
+
+    @property
+    def descend_edges(self) -> Tuple[str, ...]:
+        return self.read_edges if self.write_edges is None else self.write_edges
+
+
+# Single source of truth for opaque descent, consumed by both the read side
+# (``gen_children_of`` + policy variants) and the write side (``replace_nodes``).
+# Registration is mandatory for Expr-bearing ops and tripwire-enforced; see
+# ADR-0016 for the full design and its known blind spot.
+# Read-side descent policies are edge overrides of the derived ``OPAQUE_EDGES``
+# (see ``_gen_children_exec``/``_gen_children_skip_pins``/``gen_children_flight_leaf``).
+OPAQUE_SPECS = MappingProxyType(
+    {
+        rel.RemoteTable: OpaqueSpec(("remote_expr",)),
+        rel.CachedNode: OpaqueSpec(("parent",)),
+        rel.CacheTag: OpaqueSpec(
+            # The read/write asymmetry is load-bearing, not accidental -- it is covered
+            # by test_pinned_cache_yaml_roundtrip. Reads descend both children (see the
+            # CacheTag docstring). Writes descend only the opaque ``uncached`` payload
+            # and do not forward ``_kwargs``: ``parent`` is the materialized cache read
+            # paired with ``cache``, already produced correctly by the replacer, and
+            # re-driving it from the BFS rewrite diverges the read's backend identity
+            # from ``cache``, breaking profile resolution on load.
+            read_edges=("parent", "uncached"),
+            write_edges=("uncached",),
+            forward_kwargs=False,
+        ),
+        rel.FlightExpr: OpaqueSpec(("input_expr",)),
+        rel.FlightUDXF: OpaqueSpec(("input_expr",)),
+        udf.ExprScalarUDF: OpaqueSpec(
+            # ``computed_kwargs_expr`` lives in ``__config__``, so it is rebound by
+            # method instead of by ``__recreate__`` kwarg.
+            ("computed_kwargs_expr",),
+            rebind=lambda op, sub_expr: op.with_computed_kwargs_expr(sub_expr),
+        ),
+        rel.Read: OpaqueSpec(),  # opaque leaf: no edges on either side
+    }
+)
+
+# The opaque op types themselves -- derived from OPAQUE_SPECS so the two cannot
+# drift: being opaque and having a spec are by construction the same test
+# (``isinstance`` over the table's keys).
+opaque_ops = tuple(OPAQUE_SPECS)
+
+# Read-side edge names, derived. Descent policies override entries of this.
+OPAQUE_EDGES = MappingProxyType(
+    {typ: spec.read_edges for typ, spec in OPAQUE_SPECS.items()}
+)
+
+# Expr-typed fields on registered opaque ops that are deliberately NOT descent
+# edges. Every such exclusion is a recorded decision: the completeness test
+# (test_expr_typed_fields_are_registered) fails on an Expr-typed field that is
+# neither an edge nor listed here, so "forgot to consider it" and "considered
+# and excluded it" cannot look the same.
+NON_EDGE_EXPR_FIELDS = MappingProxyType(
+    {
+        # ``unbound_expr`` is the server-side expression over an UnboundTable;
+        # it executes inside the Flight server, not in the outer graph, so
+        # outer traversal must not surface its (unbound) leaves.
+        rel.FlightExpr: ("unbound_expr",),
+    }
+)
+
+# A non-edge exclusion only means something for a registered op: the derivation
+# below iterates OPAQUE_SPECS keys, so an entry for an unregistered type would
+# be silently inert. Fail at import time instead.
+if not set(NON_EDGE_EXPR_FIELDS) <= set(OPAQUE_SPECS):
+    raise ValueError(
+        f"NON_EDGE_EXPR_FIELDS entries for types without an OpaqueSpec "
+        f"(they would be silently ignored): "
+        f"{sorted(t.__name__ for t in set(NON_EDGE_EXPR_FIELDS) - set(OPAQUE_SPECS))}"
+    )
+
+# Per registered op type: every field name where an Expr-valued arg is
+# accounted for (descent edges on either side, plus recorded non-edges).
+# Derived, so the runtime tripwire for registered ops cannot drift from the
+# spec table or the non-edge table.
+_RECORDED_EXPR_FIELDS = MappingProxyType(
+    {
+        typ: (
+            frozenset(spec.read_edges)
+            | frozenset(spec.write_edges or ())
+            | frozenset(NON_EDGE_EXPR_FIELDS.get(typ, ()))
+        )
+        for typ, spec in OPAQUE_SPECS.items()
+    }
+)
+
+
+def _opaque_lookup(node: Node, table: Mapping) -> Any | None:
+    """Return *table*'s value for *node*'s opaque op type, or ``None``.
+
+    The single lookup shared by the read side (edge tables) and the write side
+    (``OPAQUE_SPECS``), so the two cannot diverge on how they resolve an op --
+    an exact ``type()`` lookup on one and ``isinstance`` on the other would
+    come apart the moment an opaque op grows a subclass. Matches by
+    ``isinstance`` (preserving the original ``match`` semantics); the opaque op
+    types are mutually non-subclassing, so iteration order is immaterial.
+    """
+    for typ, value in table.items():
+        if isinstance(node, typ):
+            return value
+    return None
+
+
+# Containers an arg may hold Exprs in. Annotated fields are coerced by ibis
+# (VarTuple -> tuple, Mapping -> FrozenDict), but ``Any``-typed fields are not
+# -- and ``Any`` is exactly where the tripwires earn their keep, so accept the
+# uncoerced shapes too.
+_EXPR_CONTAINERS = (tuple, list, set, frozenset)
+
+
+def _expr_args_of(node: Node) -> Tuple[str, ...]:
+    """Names of *node*'s args holding ``Expr`` values, looking one level into
+    dict and sequence/set containers.
+
+    Deliberately shallower than ``__children__``'s recursive
+    ``_flatten_collections``: no in-tree op nests an ``Expr`` two container
+    levels deep, and the static completeness test catches annotated shapes.
+    """
+    names = []
+    for name, value in zip(
+        getattr(node, "__argnames__", ()), getattr(node, "__args__", ())
+    ):
+        if isinstance(value, dict):
+            value = tuple(value.values())
+        items = value if isinstance(value, _EXPR_CONTAINERS) else (value,)
+        if any(isinstance(item, Expr) for item in items):
+            names.append(name)
+    return tuple(names)
+
+
+def _require_registered_if_expr_bearing(node: Node) -> None:
+    """Tripwire: a spec-less op holding ``Expr`` args is an *unregistered*
+    opaque op -- traversal would silently skip its sub-expressions (wrong
+    hashes, lineage and source discovery, with no failure anywhere). Raise at
+    first traversal instead. Only called for nodes with no ``OpaqueSpec``.
+    """
+    names = _expr_args_of(node)
+    if not names:
+        return
+    # Reached from ``gen_children_of``, a registered type can be absent from the
+    # *descent-policy* table in use rather than genuinely unregistered. Same
+    # symptom, opposite fix, so say which one it is. Looked up only on the raise
+    # path, so the hot path pays nothing for the distinction.
+    if _opaque_lookup(node, OPAQUE_SPECS) is not None:
+        raise ValueError(
+            f"{type(node).__name__} holds Expr-typed argument(s) {names} and "
+            f"has an OpaqueSpec, but is missing from the descent-policy edge "
+            f"table in use, so traversal would silently skip those "
+            f"sub-expressions. Prune a policy edge by overriding the type's "
+            f"edges to (), never by deleting its key."
+        )
+    raise ValueError(
+        f"{type(node).__name__} holds Expr-typed argument(s) {names} but is "
+        f"not registered in OPAQUE_SPECS; traversal would silently skip "
+        f"those sub-expressions. Add an OpaqueSpec naming its Expr edges -- "
+        f"note a registered op's children come only from its edges, never "
+        f"from the __children__ protocol, so name every Node-typed child "
+        f"as an edge too; an edge-less spec (like rel.Read's) makes it an "
+        f"opaque leaf. An Expr field that is deliberately not descended "
+        f"goes in NON_EDGE_EXPR_FIELDS."
+    )
+
+
+def _require_expr_args_recorded(node: Node) -> None:
+    """Tripwire for *registered* opaque ops: every ``Expr``-valued arg must be
+    a descent edge or a recorded non-edge. Catches a new ``Any``-typed field
+    holding an ``Expr`` growing on an already-registered op -- otherwise
+    exempt from :func:`_require_registered_if_expr_bearing`, which only runs
+    on the spec-less branch.
+    """
+    recorded = _opaque_lookup(node, _RECORDED_EXPR_FIELDS)
+    if recorded is None:
+        return
+    unrecorded = tuple(n for n in _expr_args_of(node) if n not in recorded)
+    if unrecorded:
+        raise ValueError(
+            f"{type(node).__name__} holds Expr-typed argument(s) {unrecorded} "
+            f"that are neither descent edges in its OpaqueSpec nor recorded in "
+            f"NON_EDGE_EXPR_FIELDS; traversal would silently skip them."
+        )
+
+
+def to_node(maybe_expr: Any) -> Node:
+    match maybe_expr:
+        case Node():
+            return maybe_expr
+        case Expr():
+            return maybe_expr.op()
+        case _:
+            raise ValueError(f"Don't know how to handle type {type(maybe_expr)}")
+
+
+def gen_children_of(
+    node: Node, *, opaque_edges: Mapping = OPAQUE_EDGES
+) -> Iterator[Node]:
+    """Yield a node's children, descending opaque ops per *opaque_edges*.
+
+    For an opaque op, children are the nodes referenced by its edge fields (see
+    ``OPAQUE_EDGES``); a descent policy passes a modified *opaque_edges* to prune
+    or redirect specific edges (see ``_gen_children_exec`` and friends). All
+    other nodes fall back to the standard ``__children__`` protocol.
+
+    Edge fields are read unguarded: a stale/misspelled name in an edge table
+    raises ``AttributeError`` and an unexpectedly ``None`` edge raises
+    ``ValueError`` from ``to_node``, rather than silently yielding an incomplete
+    child set. Prune an edge by removing it from the table, not by nulling it.
+    """
+    edges = _opaque_lookup(node, opaque_edges)
+    if edges is not None:
+        _require_expr_args_recorded(node)
+        gen = (to_node(getattr(node, name)) for name in edges)
+    else:
+        match node:
+            case ops.Field():
+                rel_node = node.rel
+                gen = () if rel_node is None else (to_node(rel_node),)
+            case _:
+                _require_registered_if_expr_bearing(node)
+                raw_children = getattr(node, "__children__", ())
+                gen = map(to_node, raw_children)
+    yield from filter(None, gen)
+
+
+def bfs(
+    node: Expr | Node,
+    *,
+    children: Callable[[Node], Any] = gen_children_of,
+) -> Graph:
+    """Build an opaque-descending :class:`Graph` from *node* by BFS.
+
+    ``children`` overrides child enumeration (default ``gen_children_of``); pass
+    a policy variant to prune opaque edges.
+
+    Boundary-*terminating* descent (record a node but do not descend it, as
+    ``LineageDAG.compact()`` needs to emit boundary-to-boundary edges) is not
+    expressible here and is deliberately absent: the vendored ``bfs_while``
+    filter shape drops a non-matching node together with its whole subtree, so
+    the terminating node never lands in the graph. XOR-363 adds that mechanism
+    with its first caller.
+    """
+    queue = deque((to_node(node),))
+    dct = {}
+    while queue:
+        if (node := queue.popleft()) not in dct:
+            kids = tuple(children(node))
+            dct[node] = kids
+            queue.extend(kids)
+    return Graph(dct)
+
+
+def walk_nodes(
+    node_types: type | Tuple[type, ...],
+    expr: Expr | Node,
+    *,
+    gen_children: Callable[[Node], Any] = gen_children_of,
+) -> Tuple[Node, ...]:
+    """DFS walk yielding matching nodes in parent-before-descendant order
+    for tree-shaped expressions; shared (DAG) nodes may appear before a
+    non-matching ancestor.
+
+    Callers (e.g. ``_rebuild_subexpr``) depend on ancestors appearing before
+    their descendants.  Changing traversal strategy (BFS, reverse, etc.) will
+    break that invariant.
+
+    ``gen_children`` overrides how a node's children are enumerated (defaults
+    to ``gen_children_of``); pass a variant to prune specific opaque edges
+    (see ``find_all_sources``).
+    """
+    visited = set()
+    to_visit = [to_node(expr)]
+    result = ()
+
+    while to_visit:
+        node = to_visit.pop()
+        if node in visited:
+            continue
+        visited.add(node)
+        if isinstance(node, node_types):
+            result += (node,)
+
+        to_visit += (
+            child
+            for child in OrderedDict.fromkeys(gen_children(node))
+            if child not in visited
+        )
+
+    return result
+
+
+def replace_nodes(
+    replacer: Callable[[Node, dict | None], Node], expr: Expr | Node
+) -> Node:
+    """Apply *replacer* across the expression graph, descending into opaque
+    sub-expressions (``RemoteTable.remote_expr``, ``CachedNode.parent``,
+    ``FlightExpr.input_expr``, ``ExprScalarUDF.computed_kwargs_expr``).
+
+    Only safe for **pure structural rewrites** — replacers with side effects
+    (materializing batches, registering tables on a backend, deferred writes)
+    must use ``op.replace()`` directly so they do not fire inside opaque
+    sub-expressions whose contents are handled lazily at execution time.
+    """
+    # Cache results of opaque sub-expression traversals by their root node.
+    # Sub-expression roots are often shared across multiple opaque nodes (e.g.
+    # each pipeline step's ExprScalarUDF references accumulated sub-expressions
+    # that overlap heavily), so without this memo each shared root gets
+    # re-traversed once per reference — O(n²) for a depth-n pipeline.
+    sub_expr_memo = {}
+
+    def do_recreate(op, _kwargs, **kwargs):
+        # ``_kwargs`` is keyed for the node as seen *before* the replacer ran. A
+        # replacer may change the node's type (e.g. CacheTag -> CachedNode on
+        # unpin), so keep only keys that are valid slots for the post-replacer
+        # ``op``; forwarding foreign keys would crash ``__recreate__``. Explicit
+        # overrides in ``kwargs`` always win.
+        argnames = op.__argnames__
+        merged = dict(zip(argnames, op.__args__))
+        if _kwargs:
+            merged |= {k: v for k, v in _kwargs.items() if k in argnames}
+        return op.__recreate__(merged | kwargs)
+
+    def _replace_sub(sub_op):
+        if sub_op not in sub_expr_memo:
+            sub_expr_memo[sub_op] = sub_op.replace(process_node).to_expr()
+        return sub_expr_memo[sub_op]
+
+    def process_node(op, _kwargs):
+        op = replacer(op, _kwargs)
+        # No "unhandled opaque op" guard: opaque_ops is derived from
+        # OPAQUE_SPECS and this lookup matches by isinstance over the same
+        # keys, so "no spec" and "not opaque" are the same condition.
+        spec = _opaque_lookup(op, OPAQUE_SPECS)
+        if spec is None:
+            _require_registered_if_expr_bearing(op)
+            return op
+        _require_expr_args_recorded(op)
+        if spec.rebind is not None:
+            # Exactly one edge, enforced at spec construction time.
+            (name,) = spec.descend_edges
+            rebound = spec.rebind(op, _replace_sub(to_node(getattr(op, name))))
+            return do_recreate(rebound, _kwargs if spec.forward_kwargs else None)
+        if not spec.descend_edges:
+            return op
+        overrides = {
+            name: _replace_sub(to_node(getattr(op, name)))
+            for name in spec.descend_edges
+        }
+        return do_recreate(op, _kwargs if spec.forward_kwargs else None, **overrides)
+
+    # hasattr(x, "op") is unreliable: some Nodes have an `op` field (e.g. IntervalAdd)
+    initial_op = to_node(expr)
+    op = initial_op.replace(process_node)
+    return op
+
+
+def replace_sources(source_mapping, expr, *, transfer_tables=False):
+    """Rewrite an expression graph, replacing backend sources.
+
+    Every node that carries a ``source`` attribute (DatabaseTable, Read,
+    RemoteTable, CachedNode, FlightExpr, FlightUDXF, SQLQueryResult, …) is
+    recreated with the mapped replacement when its current source is found
+    in *source_mapping*.  The mapping is keyed by backend identity (``id``).
+
+    Sub-expressions reachable only through opaque fields (``remote_expr``,
+    ``parent``, ``input_expr``, ``computed_kwargs_expr``) are rewritten
+    recursively via the existing ``replace_nodes`` infrastructure.
+
+    Parameters
+    ----------
+    source_mapping : dict[int, Any]
+        ``{id(old_backend): new_backend, ...}``
+    expr : Expr | Node
+        The expression to rewrite.
+    transfer_tables : bool, default False
+        If True, materialize and register ``DatabaseTable`` data on the new
+        backend so the rewritten expression is immediately executable.
+        If False (the default) and the rewrite would produce
+        ``DatabaseTable`` nodes whose data only exists on the old backend,
+        raise ``ValueError``.
+
+    Returns
+    -------
+    Expr
+        A new expression with sources replaced.
+
+    Raises
+    ------
+    ValueError
+        When *transfer_tables* is False and the expression contains
+        ``DatabaseTable`` nodes that require data transfer.
+    """
+
+    def _maybe_replace_cache(cache):
+        """Rebuild a Cache object if its storage.source is in the mapping."""
+        from attr import evolve  # noqa: PLC0415
+
+        storage = getattr(cache, "storage", None)
+        if storage is None:
+            return cache
+        source = getattr(storage, "source", None)
+        if source is None or id(source) not in source_mapping:
+            return cache
+        new_storage = evolve(storage, source=source_mapping[id(source)])
+        return evolve(cache, storage=new_storage)
+
+    # Track DatabaseTable nodes that need data transferred: (old_backend, new_backend, table_name)
+    tables_to_transfer = []
+
+    def replacer(node, kwargs):
+        overrides = {}
+
+        source = getattr(node, "source", None)
+        if source is not None and id(source) in source_mapping:
+            new_source = source_mapping[id(source)]
+            overrides["source"] = new_source
+
+            # DatabaseTable (but not its subclasses like CachedNode, RemoteTable,
+            # Read) needs its data transferred to the new backend.
+            if type(node) is ops.DatabaseTable:
+                tables_to_transfer.append(
+                    (source, new_source, node.name, node.namespace)
+                )
+
+        cache = getattr(node, "cache", None)
+        if cache is not None:
+            new_cache = _maybe_replace_cache(cache)
+            if new_cache is not cache:
+                overrides["cache"] = new_cache
+
+        if isinstance(node, rel.TeeNode):
+            new_writer = node.writer.replace_cons(source_mapping)
+            if new_writer is not node.writer:
+                overrides["writer"] = new_writer
+
+        if overrides or kwargs:
+            merged = dict(zip(node.__argnames__, node.__args__))
+            if kwargs:
+                merged |= kwargs
+            merged |= overrides
+            return node.__recreate__(merged)
+        return node
+
+    result = replace_nodes(replacer, expr).to_expr()
+
+    if tables_to_transfer:
+        # Filter out tables that already exist on the target backend
+        # (e.g. cloned backends that share the same underlying connection).
+        missing = _find_missing_tables(tables_to_transfer)
+        if missing:
+            if not transfer_tables:
+                names = sorted({name for _, _, name in missing})
+                raise ValueError(
+                    f"Expression contains DatabaseTable nodes {names} whose "
+                    f"data would need to be materialized and transferred to "
+                    f"the new backend. Use deferred reads (e.g. "
+                    f"deferred_read_parquet) to avoid this, or pass "
+                    f"transfer_tables=True to materialize."
+                )
+            _transfer_tables(missing)
+
+    return result
+
+
+def _namespace_to_database(namespace):
+    """Convert a Namespace to the ``database`` kwarg accepted by backend methods."""
+    if namespace.catalog and namespace.database:
+        return (namespace.catalog, namespace.database)
+    if namespace.database:
+        return namespace.database
+    return None
+
+
+def _find_missing_tables(tables_to_transfer):
+    """Return the subset of tables that don't exist on the target backend."""
+    missing = []
+    seen = set()
+    for old_backend, new_backend, table_name, namespace in tables_to_transfer:
+        key = (id(new_backend), table_name, namespace.catalog, namespace.database)
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            database = _namespace_to_database(namespace)
+            new_backend.table(table_name, database=database)
+            continue
+        except Exception:
+            pass
+        missing.append((old_backend, new_backend, table_name))
+    return missing
+
+
+def _transfer_tables(tables_to_transfer):
+    """Materialize and register table data on new backends."""
+    for old_backend, new_backend, table_name in tables_to_transfer:
+        table = old_backend.table(table_name).to_pyarrow()
+        new_backend.create_table(table_name, table)
+
+
+def replace_unbound(expr, replacement, *, target=None):
+    """Replace a single UnboundTable in *expr* with *replacement*.
+
+    When *target* is ``None`` the expression is searched for UnboundTable
+    nodes; if exactly one is found it is used as the target, otherwise a
+    ``ValueError`` is raised.  Pass *target* explicitly to skip the
+    search and replace only that specific node.
+    """
+    replacement = to_node(replacement)
+
+    if target is None:
+        found = walk_nodes(ops.UnboundTable, expr)
+        if not found:
+            raise ValueError("no UnboundTable found in expression")
+        if len(found) > 1:
+            raise ValueError(
+                f"expression contains {len(found)} UnboundTable nodes; "
+                f"pass target explicitly"
+            )
+        target = found[0]
+
+    def replacer(node, kwargs):
+        if node is target:
+            return replacement
+        elif kwargs:
+            return node.__recreate__(kwargs)
+        else:
+            return node
+
+    return replace_nodes(replacer, expr).to_expr()
+
+
+def rename_params(expr, rename_map: dict[str, str]):
+    """Rename NamedScalarParameter labels in an expression.
+
+    Parameters
+    ----------
+    expr : Expr
+        The expression to rewrite.
+    rename_map : dict[str, str]
+        ``{old_label: new_label, ...}``
+
+    Returns
+    -------
+    Expr
+        A new expression with matching parameter labels renamed.
+    """
+
+    def replacer(node, kwargs):
+        if kwargs:
+            node = node.__recreate__(kwargs)
+        if isinstance(node, NamedScalarParameter) and node.label in rename_map:
+            return NamedScalarParameter(
+                dtype=node.dtype,
+                label=rename_map[node.label],
+                default=node.default,
+            )
+        return node
+
+    return replace_nodes(replacer, expr).to_expr()
+
+
+def validate_params(expr):
+    """Raise TypeError if two NamedScalarParameter nodes share a label but have different dtypes."""
+
+    dtypes_by_label = defaultdict(set)
+    for node in walk_nodes(NamedScalarParameter, expr):
+        dtypes_by_label[node.label].add(node.dtype)
+    conflicts = {
+        label: dtypes for label, dtypes in dtypes_by_label.items() if len(dtypes) > 1
+    }
+    if conflicts:
+        messages = tuple(
+            f"Parameter label {label!r} used with conflicting dtypes: "
+            + ", ".join(str(d) for d in dtypes)
+            for label, dtypes in conflicts.items()
+        )
+        raise TypeError("\n".join(messages))
+
+
+def _node_cons(node: Node) -> Tuple[Any, ...]:
+    # A TeeNode carries its backend(s) inside its WriteThrough writer rather
+    # than a `source` attribute (a ParquetWriteThrough has none at all).
+    if isinstance(node, rel.TeeNode):
+        return node.writer.cons
+    return (node.source,)
+
+
+def get_ordered_unique_sources(nodes: Tuple[Node, ...]) -> Tuple[Any, ...]:
+    # Use id() for deduplication because backend __hash__ collides for
+    # same-class instances and __eq__ only differs by session-local idx.
+    sources, seen = (), set()
+    for source in (con for node in nodes for con in _node_cons(node)):
+        if id(source) not in seen:
+            seen.add(id(source))
+            sources += (source,)
+    return sources
+
+
+# Descent policies are OPAQUE_EDGES with specific edges overridden. Prune by
+# overriding a type's edges to (), never by deleting its key: a registered type
+# missing from the table falls to the spec-less branch, where the
+# unregistered-op tripwire raises (it names this mistake specifically, but only
+# for Expr-bearing ops -- a key deleted on a spec'd op with no Expr arg would
+# change descent silently).
+_EXEC_EDGES = MappingProxyType({**OPAQUE_EDGES, rel.CacheTag: ("parent",)})
+_SKIP_PINS_EDGES = MappingProxyType({**OPAQUE_EDGES, rel.CacheTag: ()})
+_FLIGHT_LEAF_EDGES = MappingProxyType(
+    {**OPAQUE_EDGES, rel.FlightExpr: (), rel.FlightUDXF: ()}
+)
+
+
+def _gen_children_exec(node: Node) -> Tuple[Node, ...]:
+    """Child enumeration along the *execution* path only.
+
+    Identical to ``gen_children_of`` except at a ``CacheTag``, where it
+    descends only the frozen ``parent`` read (what actually executes) and not
+    ``uncached`` (inert reconstruction payload). Mirrors ``_decompose_expr``'s
+    pruning of pinned-leaf data so source discovery stays consistent with
+    hashing.
+    """
+    return tuple(gen_children_of(node, opaque_edges=_EXEC_EDGES))
+
+
+def _gen_children_skip_pins(node: Node) -> Tuple[Node, ...]:
+    """Child enumeration that treats a ``CacheTag`` as an opaque leaf.
+
+    Descends neither ``parent`` nor ``uncached``, so a walk collects only the
+    leaves reachable *without* passing through any pin -- the "live" leaves used
+    by :func:`exclusively_pinned_leaves`.
+    """
+    return tuple(gen_children_of(node, opaque_edges=_SKIP_PINS_EDGES))
+
+
+def gen_children_flight_leaf(node: Node) -> Tuple[Node, ...]:
+    """Child enumeration treating ``FlightExpr``/``FlightUDXF`` as opaque leaves.
+
+    So a Flight node's ``input_expr`` is not flattened into the outer graph; its
+    lineage is extracted separately as a nested sub-DAG -- see
+    ``lineage_utils.extract_lineage_dag``, which passes this as ``bfs(children=)``.
+    """
+    return tuple(gen_children_of(node, opaque_edges=_FLIGHT_LEAF_EDGES))
+
+
+def exclusively_pinned_leaves(
+    expr: Expr | Node, leaf_types: type | Tuple[type, ...]
+) -> frozenset:
+    """Leaves of *expr* reachable ONLY through ``CacheTag`` (pinned) subtrees.
+
+    A leaf under a pin's frozen ``parent`` or discarded ``uncached`` upstream is
+    represented in the build hash solely by the pin's cache-key token (see
+    ``CacheTag.__dasher_tokenize__``), so callers leave it out of name
+    sanitization and hash data-leaves -- otherwise hashing stat's a possibly-
+    absent upstream source. A leaf also reachable from a live (non-pinned)
+    branch is the exception: it genuinely participates there, so it stays live.
+    Returns ``under_pin - live``.
+
+    Single predicate shared by ``_sanitize_generated_names`` and
+    ``_decompose_expr`` so the two pruning sites cannot drift.
+    """
+    under_pin = {
+        n
+        for ct in walk_nodes((rel.CacheTag,), expr)
+        for n in walk_nodes(leaf_types, ct)
+    }
+    if not under_pin:
+        return frozenset()
+    live = set(walk_nodes(leaf_types, expr, gen_children=_gen_children_skip_pins))
+    return frozenset(under_pin - live)
+
+
+# Every node type that carries a backend-bearing `.source` (or, for
+# TeeNode, `.writer.cons`). Single source of truth for "what can hold a
+# backend" -- consumers that need to reason about backend-bearing nodes
+# individually (not just get the deduplicated sources, like find_all_sources
+# does) must walk this same tuple rather than keep their own copy: a second,
+# hand-maintained list silently stops covering a node type added here later,
+# which is a fail-*open* bug (the omitted type's backend looks untouched by
+# anything, instead of looking untouched-by-nothing-we-checked).
+BACKEND_LEAF_NODE_TYPES = (
+    ops.DatabaseTable,
+    ops.SQLQueryResult,
+    rel.CachedNode,
+    rel.Read,
+    rel.RemoteTable,
+    rel.FlightUDXF,
+    rel.FlightExpr,
+    # TeeNode holds its write target's backend(s) inside its writer
+    rel.TeeNode,
+    # ExprScalarUDF has an expr we need to get to
+    # FlightOperator has a dynamically generated connection: it should be passed a Profile instead
+)
+
+
+def find_all_sources(
+    expr: Expr | Node, *, execution_only: bool = False
+) -> Tuple[Any, ...]:
+    """Distinct backend sources referenced in *expr*, in discovery order.
+
+    By default the full graph is walked, including a pinned read's
+    (``CacheTag``) ``uncached`` reconstruction payload -- serialization needs
+    those profiles to round-trip the discarded upstream (see
+    ``ExprDumper``/``dehydrate_cons``).
+
+    Pass ``execution_only=True`` for connection-selection consumers (e.g.
+    ``expr_to_unbound``): a pinned read executes only through its frozen
+    ``parent``, so ``uncached`` backends -- which may be transient or
+    unavailable after a roundtrip -- must not be reported as required sources.
+    This mirrors ``_decompose_expr``'s pruning of pinned-leaf data. A backend
+    shared between ``uncached`` and a live branch is still found via the live
+    branch.
+    """
+    gen_children = _gen_children_exec if execution_only else gen_children_of
+    nodes = walk_nodes(BACKEND_LEAF_NODE_TYPES, expr, gen_children=gen_children)
+    sources = get_ordered_unique_sources(nodes)
+    return sources

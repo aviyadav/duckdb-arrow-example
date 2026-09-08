@@ -1,0 +1,222 @@
+from __future__ import annotations
+
+import contextlib
+import contextvars
+import pathlib
+from abc import abstractmethod
+from typing import TYPE_CHECKING, Any
+
+from attr import field, frozen
+from attr.validators import instance_of
+
+from xorq.common.constants import NAME_ONLY_BACKEND_NAMES, READ_IDENTITY_KEYS
+
+
+if TYPE_CHECKING:
+    from xorq_dasher import Hasher
+
+    from xorq.expr.relations import Read
+    from xorq.vendor.ibis import Expr
+    from xorq.vendor.ibis.expr import operations as ops
+
+
+# Per-outer-call memo for ``SnapshotStrategy.normalize_databasetable``.
+# Mirrors ``_dt_normalize_memo`` in ``_relations.py`` but kept separate so
+# snapshot-flavored DT results don't alias on the same ``dt`` key used by
+# the global-hasher dispatcher.
+_snapshot_dt_normalize_memo: contextvars.ContextVar[dict | None] = (
+    contextvars.ContextVar("_xorq_snapshot_dt_normalize_memo", default=None)
+)
+
+
+def _lazy_default_key_prefix():
+    from xorq.config import options  # noqa: PLC0415
+
+    return options.get("cache.key_prefix")
+
+
+def snapshot_normalize_read(read: Read) -> tuple:
+    """Normalize Read for snapshot caching using path identity only, not file modification stats."""
+    read_kwargs = dict(read.read_kwargs)
+    if "hash_path" not in read_kwargs:
+        # path-less Read (e.g. an API-backed source): the registered
+        # normalize_method already yields declarative (stat-free) identity
+        from xorq.common.utils.dasher._opaque import (  # noqa: PLC0415
+            require_normalize_method,
+        )
+
+        return (
+            "snapshot_normalize_read",
+            read.schema,
+            require_normalize_method(read)(read),
+        )
+    # Materialized build-bundle reads carry a content-hash-named read_path that is
+    # stable across environments. Their hash_path is an absolute tmpdir path that
+    # changes every run, so prefer read_path when available.
+    read_path = read_kwargs.get("read_path")
+    path = read_path if read_path is not None else read_kwargs["hash_path"]
+    match path:
+        case list() | tuple() if len(path) == 1:
+            tpls = (("path", str(path[0])),)
+        case list() | tuple():
+            tpls = (("paths", tuple(str(p) for p in path)),)
+        case str() | pathlib.Path():
+            tpls = (("path", str(path)),)
+        case _:
+            raise NotImplementedError(f'Don\'t know how to deal with path "{path}"')
+    tpls += tuple((k, v) for k, v in read.read_kwargs if k in READ_IDENTITY_KEYS)
+    return ("snapshot_normalize_read", read.schema, tpls)
+
+
+@frozen
+class CacheStrategy:
+    key_prefix = field(
+        validator=instance_of(str),
+        factory=_lazy_default_key_prefix,
+    )
+
+    @abstractmethod
+    def calc_key(self, expr):
+        pass
+
+    def __dasher_tokenize__(self):
+        return (type(self).__name__, self.key_prefix)
+
+
+@frozen
+class ModificationTimeStrategy(CacheStrategy):
+    def calc_key(self, expr):
+        return self.key_prefix + expr.ls.tokenized
+
+
+@frozen
+class SnapshotStrategy(CacheStrategy):
+    def calc_key(self, expr: Expr) -> str:
+        with self.normalization_context(expr) as local:
+            # No RemoteTable rewrite needed: the snapshot key is independent of
+            # RemoteTable.name, and the tokenizer recurses into remote_expr /
+            # CachedNode.parent on its own.
+            tokenized = local.tokenize(expr)
+            return self.key_prefix + "-".join(("snapshot", tokenized))
+
+    @contextlib.contextmanager
+    def normalization_context(self, expr):
+        """Yield a snapshot-flavored Hasher; callers tokenize through it.
+
+        Replaces the previous dask-monkeypatching context manager: instead of
+        swapping global normalizers, we hand out a per-call hasher whose rules
+        override DatabaseTable/Read/backend normalization. The hasher is also
+        installed in ``_current_hasher`` so transitive tokenize calls inside
+        the opaque-placeholder replacer (``_parent_token``) propagate the
+        snapshot-flavored rules instead of falling back to the data-sensitive
+        global HASHER.  Per-call memos are installed alongside so repeated
+        visits of the same nodes under deeply nested into_backend chains
+        normalize once.
+        """
+        from xorq.common.utils.dasher import (  # noqa: PLC0415
+            _current_hasher,
+            _install_per_call_memos,
+            _reset_per_call_memos,
+        )
+
+        memo_tokens = _install_per_call_memos()
+        local = self._build_hasher(expr)
+        hasher_token = _current_hasher.set(local)
+        snapshot_memo_token = (
+            _snapshot_dt_normalize_memo.set({})
+            if _snapshot_dt_normalize_memo.get() is None
+            else None
+        )
+        try:
+            yield local
+        finally:
+            _current_hasher.reset(hasher_token)
+            if snapshot_memo_token is not None:
+                _snapshot_dt_normalize_memo.reset(snapshot_memo_token)
+            _reset_per_call_memos(memo_tokens)
+
+    def declared_rules(self) -> tuple:
+        """The strategy's static (fqn, normalizer) rule overrides.
+
+        This is the declared rule regime -- what the strategy layers on top of
+        the base rules regardless of any particular expression. Per-expression
+        derived rules (concrete-backend FQNs) are added by ``_build_hasher``.
+        """
+        from xorq.common.utils.dasher import fqn  # noqa: PLC0415
+        from xorq.expr.relations import Read  # noqa: PLC0415
+        from xorq.vendor import ibis  # noqa: PLC0415
+        from xorq.vendor.ibis.expr import operations as ops  # noqa: PLC0415
+
+        return (
+            (fqn(ibis.backends.BaseBackend), self.normalize_backend),
+            (fqn(ops.DatabaseTable), self.normalize_databasetable),
+            (fqn(Read), snapshot_normalize_read),
+        )
+
+    def declared_hasher(self) -> Hasher:
+        """Hasher for the declared rule regime only (no per-expr rules)."""
+        from xorq.common.utils.dasher import snapshot_hasher  # noqa: PLC0415
+
+        return snapshot_hasher(*self.declared_rules())
+
+    def _build_hasher(self, expr: Expr) -> Hasher:
+        from xorq.common.utils.dasher import fqn, snapshot_hasher  # noqa: PLC0415
+
+        extra = [
+            *self.declared_rules(),
+            # Each concrete backend subclass on the expression also needs the
+            # snapshot backend rule registered against its concrete FQN, otherwise
+            # the MRO lookup picks the more-specific subclass and bypasses our
+            # override on BaseBackend.
+            *(
+                (fqn(type(backend)), self.normalize_backend)
+                for backend in expr.ls.backends
+            ),
+        ]
+        return snapshot_hasher(*extra)
+
+    @staticmethod
+    def normalize_backend(con: Any) -> tuple:
+        from xorq.common.utils.dasher import HASHER  # noqa: PLC0415
+
+        # In-memory backends identified by name alone; remote backends
+        # delegate to HASHER.normalize which raises if unregistered. The name
+        # set is canonical (constants.NAME_ONLY_BACKEND_NAMES), never respelled
+        # here — see test_backend_names.py (gh-1842).
+        name = con.name
+        if name in NAME_ONLY_BACKEND_NAMES:
+            return (name, None)
+        return HASHER.normalize(con)
+
+    @staticmethod
+    def normalize_databasetable(dt: ops.DatabaseTable) -> tuple:
+        # Concrete-type dispatch is shared with the global dispatcher through
+        # ``view_rules`` — see its docstring for why the two tables must not be
+        # hand-mirrored (gh-2229). The fallback deliberately keeps folding
+        # `name` in — for a genuine backend table `name` *is* the identity —
+        # and ``lookup_view_normalizer`` raises rather than let a
+        # DatabaseTableView reach it.
+        from xorq.common.utils.dasher._relations import (  # noqa: PLC0415
+            lookup_view_normalizer,
+        )
+
+        memo = _snapshot_dt_normalize_memo.get()
+        if memo is not None and dt in memo:
+            return memo[dt]
+        normalizer = lookup_view_normalizer(dt, snapshot=True)
+        if normalizer is not None:
+            result = normalizer(dt)
+        else:
+            keys = ("name", "schema", "source", "namespace")
+            result = tuple((k, getattr(dt, k)) for k in keys)
+        if memo is not None:
+            memo[dt] = result
+        return result
+
+
+__all__ = [
+    "CacheStrategy",
+    "ModificationTimeStrategy",
+    "SnapshotStrategy",
+    "snapshot_normalize_read",
+]

@@ -1,0 +1,2618 @@
+import math
+import re
+import subprocess
+import threading
+from collections import Counter
+from collections.abc import Callable
+from datetime import datetime
+from functools import cache, cached_property, lru_cache
+from itertools import groupby
+from operator import attrgetter
+from pathlib import Path
+from typing import TYPE_CHECKING, Literal
+
+from attr import evolve, field, frozen
+from attr.validators import instance_of, optional
+from pygments import lex as pygments_lex
+from pygments.lexers import get_lexer_by_name as pygments_get_lexer
+from pygments.style import Style as PygmentsStyle
+from pygments.token import (
+    Comment,
+    Keyword,
+    Name,
+    Number,
+    Operator,
+    Punctuation,
+    String,
+    Token,
+)
+from rich.cells import cell_len
+from rich.text import Text
+from textual import on, work
+from textual.app import App, ComposeResult
+from textual.binding import Binding
+from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.screen import ModalScreen, Screen
+from textual.suggester import SuggestFromList
+from textual.theme import Theme
+from textual.widgets import (
+    Button,
+    DataTable,
+    Footer,
+    Header,
+    Input,
+    Select,
+    Static,
+    Tree,
+)
+
+from xorq.caching.storage import resolve_parquet_cache_path
+from xorq.catalog.catalog import Catalog, CatalogEntry
+from xorq.catalog.enums import CatalogInfix
+from xorq.catalog.exceptions import CatalogPushError
+from xorq.common.utils.caching_utils import CacheKey
+from xorq.common.utils.logging_utils import get_logger
+from xorq.common.utils.name_utils import get_uid_prefix
+from xorq.config import options
+from xorq.ibis_yaml.config import config as build_config
+from xorq.ibis_yaml.enums import ExprKind
+from xorq.ibis_yaml.sql import sql_query_deps
+from xorq.vendor.ibis.expr.types.core import SqlQueries
+
+
+if TYPE_CHECKING:
+    # Imported for annotations only: lineage_utils is loaded lazily at call
+    # sites so importing the TUI does not pull in the expression machinery.
+    from xorq.common.utils.lineage_utils import LineageRow
+
+
+logger = get_logger(__name__)
+
+
+def _find_project_path(build_dir: Path) -> Path | None:
+    """Locate the pyproject.toml project root by walking up from a build dir.
+
+    ``Catalog.add`` needs a *project_path* to (re)build wheel/requirements
+    sidecars for an unpackaged build directory, and otherwise walks up from
+    the process cwd -- which is wrong for the TUI, whose cwd need not be inside
+    the project.  Anchor the search on the build directory instead.  Returns
+    ``None`` when no pyproject.toml is found, letting ``Catalog.add`` fall back
+    to its own lookup (and raise its own error message).
+    """
+    from xorq.ibis_yaml.packager import (  # noqa: PLC0415
+        PYPROJECT_NAME,
+        find_file_upwards,
+    )
+
+    try:
+        return find_file_upwards(build_dir, PYPROJECT_NAME).parent
+    except ValueError:
+        return None
+
+
+DEFAULT_REFRESH_INTERVAL = 10
+
+
+class XorqSQLStyle(PygmentsStyle):
+    """Pygments style using xorq brand colors for SQL syntax highlighting."""
+
+    background_color = "#0a2a2e"
+    styles = {
+        Token: "#C1F0FF",
+        Keyword: "bold #C1F0FF",
+        Keyword.DML: "bold #C1F0FF",
+        Keyword.DDL: "bold #C1F0FF",
+        Name: "#C1F0FF",
+        Name.Builtin: "#7ED4C8",
+        String: "#2BBE75",
+        String.Single: "#2BBE75",
+        Number: "#F5CA2C",
+        Number.Integer: "#F5CA2C",
+        Number.Float: "#F5CA2C",
+        Comment: "italic #4AA8EC",
+        Comment.Single: "italic #4AA8EC",
+        Operator: "#5abfb5",
+        Punctuation: "#7ED4C8",
+    }
+
+
+XORQ_DARK = Theme(
+    name="xorq-dark",
+    primary="#C1F0FF",
+    secondary="#4AA8EC",
+    warning="#F5CA2C",
+    error="#FF4757",
+    success="#2BBE75",
+    accent="#C1F0FF",
+    foreground="#C1F0FF",
+    background="#05181A",
+    surface="#0a2a2e",
+    panel="#0f3338",
+    dark=True,
+    variables={
+        "flash-new": "#FF69B4",
+        "subdued": "#5abfb5",
+        "panel-dim": "#3d6670",
+        "panel-dim-fg": "#7aa8b2",
+    },
+)
+
+KIND_ORDER: tuple[ExprKind, ...] = (
+    ExprKind.Source,
+    ExprKind.Expr,
+    ExprKind.UnboundExpr,
+    ExprKind.Composed,
+    ExprKind.ExprBuilder,
+)
+
+
+_SQL_LEXER = pygments_get_lexer("sql", stripnl=False)
+
+
+@lru_cache(maxsize=64)
+def _pygments_tokens(sql: str) -> tuple[tuple[str, str], ...]:
+    tokens = []
+    for ttype, value in pygments_lex(sql, _SQL_LEXER):
+        info = XorqSQLStyle.style_for_token(ttype)
+        parts = []
+        if info.get("bold"):
+            parts.append("bold")
+        if info.get("italic"):
+            parts.append("italic")
+        if info.get("color"):
+            parts.append(f"#{info['color']}")
+        tokens.append((value, " ".join(parts)))
+    return tuple(tokens)
+
+
+def _pygments_to_text(sql: str) -> Text:
+    text = Text(no_wrap=False, overflow="fold")
+    for value, style in _pygments_tokens(sql):
+        text.append(value, style=style)
+    return text
+
+
+def _render_sql_text(raw: str) -> Text:
+    # Line-length is intentionally unchecked: extremely wide lines render slowly
+    # in Textual, but that's an acceptable tradeoff vs. adding another heuristic.
+    max_lines = options.tui.sql_highlight_max_lines
+    if max_lines == 0 or raw.count("\n") >= max_lines:
+        note = (
+            "-- syntax highlighting disabled\n"
+            if max_lines == 0
+            else f"-- syntax highlighting disabled (query exceeds {max_lines} lines)\n"
+        )
+        rich_text = Text(no_wrap=False, overflow="fold")
+        rich_text.append(note, style="italic #4AA8EC")
+        rich_text.append(raw)
+        return rich_text
+    return _pygments_to_text(raw)
+
+
+@frozen
+class KindStyle:
+    icon: str = field(validator=instance_of(str))
+    color: str = field(validator=instance_of(str))
+
+
+KIND_STYLES: dict[ExprKind, KindStyle] = {
+    ExprKind.Source: KindStyle(icon="⊞", color=XORQ_DARK.primary),
+    ExprKind.Expr: KindStyle(icon="⊕", color=XORQ_DARK.success),
+    ExprKind.UnboundExpr: KindStyle(icon="⊘", color=XORQ_DARK.warning),
+    ExprKind.Composed: KindStyle(icon="⊛", color=XORQ_DARK.secondary),
+    ExprKind.ExprBuilder: KindStyle(icon="⊡", color=XORQ_DARK.secondary),
+}
+
+CACHE_STYLE: dict[bool | None, tuple[str, str]] = {
+    True: ("●", XORQ_DARK.success),
+    False: ("○", XORQ_DARK.warning),
+    None: ("—", "dim"),
+}
+
+# Icon + colour per lineage boundary kind. Keyed by the *base* kind, so
+# `tag:catalog-source` styles as a tag. Process boundaries (Flight) get the
+# loudest colour: they are the only hop that leaves the process.
+BOUNDARY_STYLES: dict[str, KindStyle] = {
+    "flight_udxf": KindStyle(icon="✈", color=XORQ_DARK.variables["flash-new"]),
+    "flight_expr": KindStyle(icon="✈", color=XORQ_DARK.variables["flash-new"]),
+    "engine_crossing": KindStyle(icon="⇄", color=XORQ_DARK.secondary),
+    "cache": KindStyle(icon="◈", color=XORQ_DARK.success),
+    "pin": KindStyle(icon="⊙", color=XORQ_DARK.success),
+    "ingestion": KindStyle(icon="⇤", color=XORQ_DARK.warning),
+    "udf": KindStyle(icon="ƒ", color=XORQ_DARK.variables["subdued"]),
+    "join": KindStyle(icon="⋈", color=XORQ_DARK.primary),
+    "table": KindStyle(icon="⊞", color=XORQ_DARK.primary),
+    "unbound": KindStyle(icon="⊘", color=XORQ_DARK.warning),
+    "tag": KindStyle(icon="⚑", color=XORQ_DARK.variables["subdued"]),
+}
+
+# A legacy sidecar has no boundary annotation at all, so every row lands here.
+UNKNOWN_BOUNDARY_STYLE = KindStyle(icon="·", color=XORQ_DARK.variables["panel-dim-fg"])
+
+
+# Fold gutter, two columns wide on every row so the labels stay aligned: a node
+# that stores a schema can be expanded with `]` to list its columns, and folded
+# back with `[`.
+EXPANDABLE_MARKER = "▸ "
+EXPANDED_MARKER = "▾ "
+NO_MARKER = "  "
+
+# Lines the panel prints above the tree: Cache, Hash, and the blank between.
+LINEAGE_TREE_OFFSET = 3
+
+# Columns are the expansion itself, not something to expand further, so they get
+# no icon and no gutter marker -- just a dim, indented row.
+COLUMN_ROW_STYLE = "dim italic"
+
+
+def _render_lineage_rows(
+    rows: "tuple[LineageRow, ...]",
+    expanded: frozenset[str] = frozenset(),
+    cursor_row: int | None = None,
+    expandable: frozenset[str] = frozenset(),
+) -> Text:
+    """Style a compact lineage tree: glyphs dim, icon+label per boundary kind,
+    collapsed `via [...]` runs dim.  Its `.plain` is the plain-text tree.
+
+    *expanded* is the set of node ids whose columns are listed, which marks their
+    rows `▾`; *expandable* is the set that could be, marked `▸`; *cursor_row* is
+    the index of the row the fold keys act on, rendered reversed.
+    """
+    from xorq.common.utils.lineage_utils import COLUMN_KIND  # noqa: PLC0415
+
+    text = Text(no_wrap=False, overflow="fold")
+    for i, row in enumerate(rows):
+        if i:
+            text.append("\n")
+        on_cursor = i == cursor_row
+        # The cursor is a whole-line reverse, so every span on the line carries it.
+        cursor = " reverse" if on_cursor else ""
+        if row.kind == COLUMN_KIND:
+            text.append(row.prefix, style=f"dim{cursor}")
+            text.append(NO_MARKER, style=f"dim{cursor}")
+            text.append(row.label, style=f"{COLUMN_ROW_STYLE}{cursor}")
+            if on_cursor:
+                text.append(" ", style="reverse")
+            continue
+        style = BOUNDARY_STYLES.get(row.kind, UNKNOWN_BOUNDARY_STYLE)
+        if row.node_id in expanded:
+            marker = EXPANDED_MARKER
+        elif row.node_id in expandable:
+            marker = EXPANDABLE_MARKER
+        else:
+            marker = NO_MARKER
+        text.append(row.prefix, style=f"dim{cursor}")
+        text.append(marker, style=f"dim{cursor}")
+        text.append(f"{style.icon} ", style=f"bold {style.color}{cursor}")
+        text.append(row.label, style=f"{style.color}{cursor}")
+        if row.via:
+            text.append(row.via_suffix, style=f"dim italic{cursor}")
+        elif on_cursor:
+            # one reversed trailing cell, so the cursor reads as a cursor even
+            # when the label ends the line (Rich pads with unstyled cells)
+            text.append(" ", style="reverse")
+    return text
+
+
+FLASH_NEW = XORQ_DARK.variables["flash-new"]
+SUBDUED = XORQ_DARK.variables["subdued"]
+
+SCHEMA_PREVIEW_COLUMNS = ("NAME", "TYPE")
+
+REVISION_COLUMNS = ("STATUS", "HASH", "COLUMNS", "CACHED", "DATE")
+
+GIT_LOG_COLUMNS = ("HASH", "DATE", "MESSAGE")
+
+
+def _styled_branch_label(kind: str, count: int) -> Text:
+    style = KIND_STYLES[kind]
+    label = Text()
+    label.append(f"{style.icon} ", style=f"bold {style.color}")
+    label.append(f"{kind} ", style=f"bold {style.color}")
+    label.append(f"({count})", style=f"dim {style.color}")
+    return label
+
+
+def _format_cached(value: bool | None) -> str:
+    return CACHE_STYLE[value][0]
+
+
+def get_cache_key_path(cache_key: CacheKey | None) -> str | None:
+    return (
+        str(resolve_parquet_cache_path(cache_key.relative_path, cache_key.key))
+        if cache_key is not None
+        else None
+    )
+
+
+@frozen
+class CatalogRowData:
+    entry: CatalogEntry = field(repr=False)
+    aliases: tuple[str, ...] = field(factory=tuple, validator=instance_of(tuple))
+
+    @property
+    def cached(self) -> bool | None:
+        if path := get_cache_key_path(self.entry.projected_cache_key):
+            return Path(path).exists()
+        return None
+
+    @property
+    def kind(self) -> str:
+        return str(self.entry.kind)
+
+    @property
+    def hash(self) -> str:
+        return self.entry.name
+
+    @property
+    def schema_in(self) -> tuple[tuple[str, str], ...] | None:
+        si = self.entry.metadata.schema_in
+        return tuple(si.items()) if si is not None else None
+
+    @property
+    def schema_out(self) -> tuple[tuple[str, str], ...]:
+        return tuple(self.entry.metadata.schema_out.items())
+
+    @cached_property
+    def aliases_display(self) -> str:
+        return ", ".join(self.aliases) if self.aliases else ""
+
+    @property
+    def cached_display(self) -> str:
+        return _format_cached(self.cached)
+
+    @cached_property
+    def sqls(self) -> SqlQueries:
+        """((name, engine, sql, relations), ...) for all queries in the expression plan."""
+        return self.entry.metadata.sql_queries
+
+    @cached_property
+    def _lineage_line_cache(self) -> dict:
+        # The TUI re-renders the panel on every keypress, so the walk is done once
+        # per fold state rather than once per key.
+        return {}
+
+    def lineage_lines(
+        self, expand_columns: frozenset[str] = frozenset()
+    ) -> "tuple[LineageRow, ...]":
+        """The tree's rows, listing the columns of every node in *expand_columns*."""
+        from xorq.common.utils.lineage_utils import (  # noqa: PLC0415
+            compact_lineage_rows,
+        )
+
+        if expand_columns in self._lineage_line_cache:
+            return self._lineage_line_cache[expand_columns]
+        lineage = self.entry.metadata.lineage
+        rows = (
+            ()
+            if not lineage or not lineage.nodes
+            else compact_lineage_rows(lineage, expand_columns=expand_columns)
+        )
+        self._lineage_line_cache[expand_columns] = rows
+        return rows
+
+    @cached_property
+    def lineage_expandable(self) -> frozenset[str]:
+        """Ids of the nodes that store a schema, so `]` has columns to show."""
+        from xorq.common.utils.lineage_utils import node_columns  # noqa: PLC0415
+
+        lineage = self.entry.metadata.lineage
+        if not lineage or not lineage.nodes:
+            return frozenset()
+        return frozenset(
+            nid for nid, node in lineage.by_id.items() if node_columns(node)
+        )
+
+    @cached_property
+    def lineage_rich(self) -> Text:
+        rows = self.lineage_lines()
+        return (
+            Text("(empty)", style="dim")
+            if not rows
+            else _render_lineage_rows(rows, expandable=self.lineage_expandable)
+        )
+
+    @cached_property
+    def lineage_text(self) -> str:
+        # Plain form of the styled render, so the two can never drift.
+        return self.lineage_rich.plain
+
+    @cached_property
+    def cache_info_text(self) -> str:
+        path = get_cache_key_path(self.entry.projected_cache_key)
+        match path:
+            case None:
+                return "— unknown"
+            case _ if Path(path).exists():
+                return f"● cached  {path}"
+            case _:
+                return "○ uncached"
+
+    def lineage_panel_rich(
+        self,
+        expand_columns: frozenset[str] = frozenset(),
+        cursor_row: int | None = None,
+    ) -> Text:
+        # Cache/Hash first: the lineage tree is unbounded in depth, so rendering
+        # it last would push the entry's identity off the top of the panel.
+        text = Text(no_wrap=False, overflow="fold")
+        text.append("Cache: ", style="bold")
+        text.append(self.cache_info_text)
+        text.append("\nHash: ", style="bold")
+        text.append(self.hash)
+        text.append("\n\n")
+        rows = self.lineage_lines(expand_columns)
+        if not rows:
+            text.append("(empty)", style="dim")
+        else:
+            text.append_text(
+                _render_lineage_rows(
+                    rows,
+                    expanded=expand_columns,
+                    cursor_row=cursor_row,
+                    expandable=self.lineage_expandable,
+                )
+            )
+        return text
+
+    def lineage_panel_text(
+        self,
+        expand_columns: frozenset[str] = frozenset(),
+        cursor_row: int | None = None,
+    ) -> str:
+        return self.lineage_panel_rich(expand_columns, cursor_row).plain
+
+    @property
+    def row_key(self) -> str:
+        return self.hash
+
+
+@frozen
+class GitLogRowData:
+    hash: str = field(default="", validator=instance_of(str))
+    date: str = field(default="", validator=instance_of(str))
+    message: str = field(default="", validator=instance_of(str))
+
+    @property
+    def row(self) -> tuple[str, ...]:
+        return (self.hash, self.date, self.message)
+
+
+@frozen
+class RevisionRowData:
+    hash: str = field(default="", validator=instance_of(str))
+    column_count: int | None = field(default=None, validator=optional(instance_of(int)))
+    cached: bool | None = field(default=None, validator=optional(instance_of(bool)))
+    commit_date: str = field(default="", validator=instance_of(str))
+    is_current: bool = field(default=False, validator=instance_of(bool))
+
+    @cached_property
+    def cached_display(self) -> str:
+        return _format_cached(self.cached)
+
+    @cached_property
+    def status_display(self) -> str:
+        return "CURRENT →" if self.is_current else ""
+
+    @cached_property
+    def columns_display(self) -> str:
+        match self.column_count:
+            case None:
+                return "?"
+            case int(n):
+                return f"{n} cols"
+            case _:
+                return "?"
+
+    @property
+    def row(self) -> tuple[str, ...]:
+        return (
+            self.status_display,
+            self.hash,
+            self.columns_display,
+            self.cached_display,
+            self.commit_date,
+        )
+
+
+@cache
+def _ibis_table_method_names() -> tuple[str, ...]:
+    """Public method names on the ibis Table class, for tab-completion."""
+    from xorq.vendor.ibis.expr.types.relations import Table  # noqa: PLC0415
+
+    return tuple(name for name in dir(Table) if not name.startswith("_"))
+
+
+@frozen
+class ExprStep:
+    """A single user-applied Ibis operation."""
+
+    verb: str = field(validator=instance_of(str))
+    user_input: str = field(validator=instance_of(str))
+    code: str = field(validator=instance_of(str))
+
+
+@frozen
+class ExprStack:
+    """Immutable operation stack with undo/redo cursor."""
+
+    base_expr: object = field(repr=False)
+    steps: tuple[ExprStep, ...] = field(factory=tuple)
+    cursor: int = field(default=0, validator=instance_of(int))
+
+    def push(self, step: ExprStep) -> "ExprStack":
+        """Apply new step, discard any steps after cursor (fork)."""
+        return evolve(
+            self,
+            steps=self.steps[: self.cursor] + (step,),
+            cursor=self.cursor + 1,
+        )
+
+    def undo(self) -> "ExprStack":
+        return evolve(self, cursor=max(0, self.cursor - 1))
+
+    def redo(self) -> "ExprStack":
+        return evolve(self, cursor=min(len(self.steps), self.cursor + 1))
+
+    @property
+    def can_undo(self) -> bool:
+        return self.cursor > 0
+
+    @property
+    def can_redo(self) -> bool:
+        return self.cursor < len(self.steps)
+
+    @property
+    def current_code(self) -> str:
+        """Single evaluable expression chaining all active steps.
+
+        Each step is wrapped in a ``(lambda source: step_code)(prior)`` call,
+        so every ``source`` identifier in the step binds to the prior step's
+        result via the same namespace mechanism ``_eval_code`` uses — no
+        string substitution of ``source`` inside user code.
+        """
+        if self.cursor == 0:
+            return ""
+        result = "source"
+        for step in self.steps[: self.cursor]:
+            result = f"(lambda source: {step.code})({result})"
+        return result
+
+
+def _entry_info(entry: CatalogEntry) -> tuple[int | None, bool | None]:
+    path = get_cache_key_path(entry.projected_cache_key)
+    cached = Path(path).exists() if path is not None else None
+    return len(entry.columns), cached
+
+
+def _load_catalog_row(entry, aliases=()) -> CatalogRowData:
+    return CatalogRowData(entry=entry, aliases=aliases)
+
+
+@cache
+def _catalog_list_cached(catalog, yaml_mtime: float) -> tuple:
+    """Compute catalog entry list; auto-invalidates when yaml mtime changes."""
+    return tuple(catalog.list())
+
+
+def _get_catalog_list(catalog) -> tuple:
+    """Return catalog entry list, recomputing only when the YAML file has changed."""
+    yaml_mtime = catalog.catalog_yaml.yaml_path.stat().st_mtime
+    return _catalog_list_cached(catalog, yaml_mtime)
+
+
+@cache
+def _catalog_aliases_cached(
+    catalog: Catalog, yaml_mtime: float, aliases_mtime: float
+) -> tuple:
+    """Compute catalog aliases; auto-invalidates when yaml or aliases/ changes."""
+    return tuple(catalog.catalog_aliases)
+
+
+def _get_catalog_aliases(catalog: Catalog) -> tuple:
+    """Return catalog aliases, recomputing only when they may have changed.
+
+    The YAML mtime alone misses a pure repoint of an existing alias to
+    another existing entry: that rewrites only the symlink under ``aliases/``
+    (the alias is already listed in catalog.yaml, so no yaml write happens).
+    Replacing a symlink updates its parent directory's mtime, so key on that
+    as well.
+    """
+    yaml_mtime = catalog.catalog_yaml.yaml_path.stat().st_mtime
+    aliases_dir = catalog.repo_path.joinpath(CatalogInfix.ALIAS)
+    aliases_mtime = aliases_dir.stat().st_mtime if aliases_dir.exists() else 0.0
+    return _catalog_aliases_cached(catalog, yaml_mtime, aliases_mtime)
+
+
+@cache
+def _build_alias_multimap(
+    catalog_aliases,
+) -> dict[str, tuple[str, ...]]:
+    key = attrgetter("catalog_entry.name")
+    sorted_aliases = sorted(catalog_aliases, key=key)
+    return {
+        name: tuple(sorted(ca.alias for ca in group))
+        for name, group in groupby(sorted_aliases, key=key)
+    }
+
+
+@lru_cache(maxsize=256)
+def _list_revisions_cached(catalog_alias, head_sha: str) -> tuple:
+    """Cache an alias's git-revision walk; auto-invalidates when repo HEAD moves.
+
+    The walk (``repo.iter_commits`` -> a ``git rev-list`` subprocess) is the
+    expensive part of building the Revisions panel.  Keying on the repo HEAD
+    sha invalidates the cache whenever the catalog gains a commit (add /
+    remove / compose).  The cached tuple is the complete walk result; callers
+    reformat rows on each render (see ``_load_revisions_preview``) but do not
+    re-walk.
+    """
+    return catalog_alias.list_revisions()
+
+
+def _build_git_log_rows(repo, max_count=100) -> tuple[GitLogRowData, ...]:
+    return tuple(
+        GitLogRowData(
+            hash=commit.hexsha[:12],
+            date=datetime.fromtimestamp(commit.committed_date).strftime(
+                "%Y-%m-%d %H:%M"
+            ),
+            message=commit.message.strip().split("\n")[0],
+        )
+        for commit in repo.iter_commits(max_count=max_count)
+    )
+
+
+def _dag_label(name: str) -> str:
+    """Truncate a trailing generated token, keeping the descriptive prefix.
+
+    Recognizes the shapes the build pipeline produces: a whole-name legacy hex
+    hash, a raw gen_name uid (ibis_<ns>_<26 chars>, kept by reads that skip
+    hex sanitization, e.g. pinned leaves — get_uid_prefix is the canonical
+    recognizer), or an underscore-separated 32-hex dasher token. Anything else
+    is user-chosen and kept whole — a greedy hex match would eat a prefix that
+    happens to end in hex characters and collapse sibling labels to the same
+    string. Tokens truncate to config.hash_length, the width .sql artifact
+    names already use.
+    """
+    n = build_config.hash_length
+    if re.fullmatch(r"[a-f0-9]{20,}", name):
+        return name[:n]
+    if prefix := get_uid_prefix(name):
+        return f"{prefix}{name[len(prefix) :][:n]}"
+    return re.sub(r"(?<=_)[a-f0-9]{32}$", lambda m: m.group(0)[:n], name)
+
+
+def _render_sql_dag(sqls: SqlQueries) -> str:
+    """Render multiple SQL queries as a topologically-sorted DAG."""
+    name_to_sql = {name: (engine, sql) for name, engine, sql, _ in sqls}
+    deps = sql_query_deps(sqls)
+    if not any(relations for *_, relations in sqls):
+        # entries recorded before relations existed: fall back to scanning the
+        # SQL for quoted legacy hex names (user-named into_backend sub-queries),
+        # the one dependency shape the pre-relations renderer could order.
+        deps = {
+            name: frozenset(
+                ref
+                for ref in re.findall(r'FROM "([a-f0-9]{20,})"', sql)
+                if ref != name and ref in name_to_sql
+            )
+            for name, (_, sql) in name_to_sql.items()
+        }
+    # topological sort (Kahn's algorithm) — leaves first, main last
+    in_degree = {n: len(d) for n, d in deps.items()}
+    queue = [n for n, d in in_degree.items() if d == 0]
+    order = []
+    while queue:
+        node = queue.pop(0)
+        order.append(node)
+        for n, d in deps.items():
+            if node in d:
+                in_degree[n] -= 1
+                if in_degree[n] == 0:
+                    queue.append(n)
+    # append any remaining (cycle fallback)
+    order.extend(n for n in name_to_sql if n not in order)
+
+    return "\n\n  ↓\n\n".join(
+        f"-- [{_dag_label(name)}] ({engine})\n{sql}"
+        for name in order
+        for engine, sql in (name_to_sql[name],)
+    )
+
+
+def _revision_pair(i, rev_entry, commit):
+    exists = rev_entry.exists()
+    col_count, cached = _entry_info(rev_entry) if exists else (None, None)
+    row = RevisionRowData(
+        hash=rev_entry.name,
+        column_count=col_count,
+        cached=cached,
+        commit_date=datetime.fromtimestamp(commit.committed_date).strftime(
+            "%Y-%m-%d %H:%M"
+        ),
+        is_current=(i == 0),
+    )
+    return row, (rev_entry, commit, exists)
+
+
+# ---------------------------------------------------------------------------
+# Screens
+# ---------------------------------------------------------------------------
+
+
+class AddEntryScreen(ModalScreen[tuple[str, str | None] | None]):
+    """Collect a build directory path and optional alias for a new entry."""
+
+    BINDINGS = (
+        Binding("ctrl+r", "confirm", "Add"),
+        Binding("escape", "cancel", "Cancel"),
+    )
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="add-entry-dialog", classes="entry-action-dialog"):
+            yield Static("Add catalog entry", classes="entry-action-title")
+            yield Static(
+                "Enter a build directory path. Paths may be absolute or relative "
+                "to the current directory.",
+                classes="entry-action-message",
+            )
+            yield Input(
+                placeholder="build directory path",
+                id="add-entry-path",
+            )
+            yield Input(
+                placeholder="alias (optional)",
+                id="add-entry-alias",
+            )
+            with Horizontal(classes="entry-action-buttons"):
+                yield Button("Cancel", id="cancel-add-entry")
+                yield Button("Add Entry", id="confirm-add-entry", variant="success")
+
+    def action_confirm(self) -> None:
+        path = self.query_one("#add-entry-path", Input).value.strip()
+        if not path:
+            self.app.notify(
+                "Enter a build directory path.",
+                title="Add Entry",
+                severity="warning",
+            )
+            return
+        build_dir = Path(path).expanduser()
+        if not build_dir.exists():
+            self.app.notify(
+                f"Path does not exist: {path}",
+                title="Add Entry",
+                severity="warning",
+            )
+            return
+        if not build_dir.is_dir():
+            self.app.notify(
+                f"Build path is not a directory: {path}",
+                title="Add Entry",
+                severity="warning",
+            )
+            return
+        alias = self.query_one("#add-entry-alias", Input).value.strip() or None
+        self.dismiss((path, alias))
+
+    @on(Button.Pressed)
+    def _on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "confirm-add-entry":
+            self.action_confirm()
+        else:
+            self.action_cancel()
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class AddAliasScreen(ModalScreen[str | None]):
+    """Collect an alias to attach to the selected entry."""
+
+    BINDINGS = (
+        Binding("ctrl+r", "confirm", "Add"),
+        Binding("escape", "cancel", "Cancel"),
+    )
+
+    def __init__(self, row_data: CatalogRowData):
+        super().__init__()
+        self._row_data = row_data
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="add-alias-dialog", classes="entry-action-dialog"):
+            yield Static("Add alias", classes="entry-action-title")
+            yield Static(
+                f"Attach a new alias to {self._row_data.hash}.",
+                classes="entry-action-message",
+            )
+            yield Input(placeholder="alias", id="add-alias-name")
+            with Horizontal(classes="entry-action-buttons"):
+                yield Button("Cancel", id="cancel-add-alias")
+                yield Button("Add Alias", id="confirm-add-alias", variant="success")
+
+    def action_confirm(self) -> None:
+        alias = self.query_one("#add-alias-name", Input).value.strip()
+        if not alias:
+            self.app.notify(
+                "Enter an alias.",
+                title="Add Alias",
+                severity="warning",
+            )
+            return
+        self.dismiss(alias)
+
+    @on(Button.Pressed)
+    def _on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "confirm-add-alias":
+            self.action_confirm()
+        else:
+            self.action_cancel()
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class DeleteEntryScreen(ModalScreen[bool]):
+    """Confirm removal of an entry and all aliases that point to it."""
+
+    BINDINGS = (
+        Binding("ctrl+r", "confirm", "Delete"),
+        Binding("escape", "cancel", "Cancel"),
+    )
+
+    def __init__(self, row_data: CatalogRowData):
+        super().__init__()
+        self._row_data = row_data
+
+    def compose(self) -> ComposeResult:
+        row_data = self._row_data
+        aliases = (
+            f"\nAliases also removed: {row_data.aliases_display}"
+            if row_data.aliases
+            else ""
+        )
+        with Vertical(id="delete-entry-dialog", classes="entry-action-dialog"):
+            yield Static("Delete catalog entry?", classes="entry-action-title")
+            yield Static(
+                f"{row_data.hash}\n\nThis removes the entry from the catalog.{aliases}",
+                classes="entry-action-message",
+            )
+            with Horizontal(classes="entry-action-buttons"):
+                yield Button("Cancel", id="cancel-delete-entry")
+                yield Button("Delete Entry", id="confirm-delete-entry", variant="error")
+
+    @on(Button.Pressed)
+    def _on_button_pressed(self, event: Button.Pressed) -> None:
+        self.dismiss(event.button.id == "confirm-delete-entry")
+
+    def action_confirm(self) -> None:
+        self.dismiss(True)
+
+    def action_cancel(self) -> None:
+        self.dismiss(False)
+
+
+class RemoveAliasScreen(ModalScreen[str | None]):
+    """Choose and confirm an alias to detach from a catalog entry."""
+
+    BINDINGS = (
+        Binding("ctrl+r", "confirm", "Remove"),
+        Binding("escape", "cancel", "Cancel"),
+    )
+
+    def __init__(self, row_data: CatalogRowData):
+        super().__init__()
+        self._row_data = row_data
+
+    def compose(self) -> ComposeResult:
+        aliases = self._row_data.aliases
+        with Vertical(id="remove-alias-dialog", classes="entry-action-dialog"):
+            yield Static("Remove alias?", classes="entry-action-title")
+            yield Static(
+                "The catalog entry and its other aliases will be kept.",
+                classes="entry-action-message",
+            )
+            yield Select(
+                ((alias, alias) for alias in aliases),
+                value=aliases[0],
+                allow_blank=False,
+                id="remove-alias-select",
+            )
+            with Horizontal(classes="entry-action-buttons"):
+                yield Button("Cancel", id="cancel-remove-alias")
+                yield Button(
+                    "Remove Alias", id="confirm-remove-alias", variant="warning"
+                )
+
+    def _selected_alias(self) -> str | None:
+        value = self.query_one("#remove-alias-select", Select).value
+        return value if isinstance(value, str) else None
+
+    @on(Button.Pressed)
+    def _on_button_pressed(self, event: Button.Pressed) -> None:
+        self.dismiss(
+            self._selected_alias()
+            if event.button.id == "confirm-remove-alias"
+            else None
+        )
+
+    def action_confirm(self) -> None:
+        self.dismiss(self._selected_alias())
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class CatalogScreen(Screen):
+    BINDINGS = (
+        Binding("q", "quit_app", "Quit"),
+        Binding("ctrl+c", "quit_app", "Quit", show=False),
+        Binding("h", "tree_collapse", "Collapse", show=False),
+        Binding("j", "cursor_down", "Down", show=False),
+        Binding("k", "cursor_up", "Up", show=False),
+        Binding("l", "tree_expand", "Expand", show=False),
+        # Fold a lineage node's columns. Separate keys from the tree's h/l so the
+        # two folds never depend on which panel happens to hold focus; shown in
+        # the footer only while the Lineage panel does (see check_action).
+        Binding("]", "lineage_expand", "Columns", key_display="]"),
+        Binding("[", "lineage_collapse", "Fold", key_display="["),
+        Binding("right_square_bracket", "lineage_expand", "Columns", show=False),
+        Binding("left_square_bracket", "lineage_collapse", "Fold", show=False),
+        Binding("tab", "focus_next_panel", "Next", show=False),
+        Binding("shift+tab", "focus_prev_panel", "Prev", show=False),
+        Binding("e", "open_data_view", "Explore"),
+        Binding("a", "add_entry", "Add Entry"),
+        # Terminals report Shift+A as the uppercase character "A", not the
+        # synthetic key name "shift+a" used by Textual's test pilot.
+        Binding("A", "add_alias", "Add Alias"),
+        Binding("r", "remove_alias", "Remove Alias"),
+        Binding("d", "delete_entry", "Delete"),
+        Binding("v", "toggle_revisions", "Revisions"),
+        Binding("g", "toggle_git_log", "Git Log"),
+        Binding("1", "view_lineage", "Lineage", priority=True),
+        Binding("2", "view_sql", "SQL", priority=True),
+        Binding("3", "view_data", "Data", priority=True),
+    )
+
+    FOCUS_CYCLE = (
+        "#catalog-tree",
+        "#lineage-panel",
+        "#sql-panel",
+        "#data-preview-panel",
+        "#schema-preview-table",
+    )
+
+    def __init__(self, refresh_interval=DEFAULT_REFRESH_INTERVAL):
+        super().__init__()
+        self._refresh_interval = refresh_interval
+        self._row_cache: dict[str, CatalogRowData] = {}
+        # Written under _refresh_lock on worker thread; read on main thread
+        # only via call_from_thread callbacks or during locked render calls.
+        self._new_keys: set[str] = set()
+        self._git_log_visible = options.tui.git_log_open
+        self._git_log_loaded = False
+        self._refresh_lock = threading.Lock()
+        self._active_view: Literal["lineage", "sql", "data"] = "lineage"
+        self._data_preview_hash: str | None = None
+        self._current_sql_hash: str | None = None
+        self._highlight_timer = None
+        # Lineage fold state, per entry: which nodes are drawn raw, and the node
+        # the fold keys act on. Keyed by entry hash so browsing away and back
+        # keeps each entry's expansions, and a refresh re-render preserves them.
+        self._lineage_expanded: dict[str, frozenset[str]] = {}
+        self._lineage_cursor: dict[str, str] = {}
+        # Rows of the entry rendered last, so cursor moves need no re-walk.
+        self._lineage_rows: "tuple[LineageRow, ...]" = ()
+
+    def compose(self) -> ComposeResult:
+        yield Header(show_clock=True)
+        with Horizontal(id="main-split"):
+            with Vertical(id="left-column"):
+                with Vertical(id="catalog-panel"):
+                    yield Tree("Catalog", id="catalog-tree")
+                with Vertical(id="revisions-panel"):
+                    yield DataTable(id="revisions-preview-table")
+                with Vertical(id="git-log-panel"):
+                    yield DataTable(id="git-log-table")
+            with Vertical(id="right-column"):
+                # Scrollable: the lineage tree is multi-line and unbounded in
+                # depth, so the panel cannot show all of it at any fixed height.
+                with VerticalScroll(id="lineage-panel"):
+                    yield Static("", id="lineage-content")
+                with VerticalScroll(id="sql-panel"):
+                    yield Static("", id="sql-preview")
+                with Vertical(id="data-preview-panel"):
+                    yield Static("", id="data-preview-status")
+                    yield DataTable(id="data-preview-table")
+                with Vertical(id="schema-panel"):
+                    with Horizontal(id="schema-split"):
+                        with Vertical(id="schema-in-half"):
+                            yield DataTable(id="schema-in-table")
+                        with Vertical(id="schema-out-half"):
+                            yield DataTable(id="schema-preview-table")
+        yield Static("", id="status-bar")
+        yield Footer()
+
+    def on_mount(self) -> None:
+        tree = self.query_one("#catalog-tree", Tree)
+        tree.show_root = False
+        tree.guide_depth = 3
+
+        schema_in_table = self.query_one("#schema-in-table", DataTable)
+        schema_in_table.cursor_type = "row"
+        schema_in_table.zebra_stripes = True
+        for col in SCHEMA_PREVIEW_COLUMNS:
+            schema_in_table.add_column(col, key=col)
+
+        schema_table = self.query_one("#schema-preview-table", DataTable)
+        schema_table.cursor_type = "row"
+        schema_table.zebra_stripes = True
+        for col in SCHEMA_PREVIEW_COLUMNS:
+            schema_table.add_column(col, key=col)
+
+        rev_table = self.query_one("#revisions-preview-table", DataTable)
+        rev_table.cursor_type = "row"
+        rev_table.zebra_stripes = True
+        for col in REVISION_COLUMNS:
+            rev_table.add_column(col, key=col)
+
+        git_log_table = self.query_one("#git-log-table", DataTable)
+        git_log_table.cursor_type = "row"
+        git_log_table.zebra_stripes = True
+        for col in GIT_LOG_COLUMNS:
+            git_log_table.add_column(col, key=col)
+
+        data_table = self.query_one("#data-preview-table", DataTable)
+        data_table.cursor_type = "none"
+        data_table.zebra_stripes = True
+        data_table.loading = True
+
+        self.query_one("#catalog-panel").border_title = "Expressions"
+        self.query_one("#schema-panel").border_title = "Schema"
+        self.query_one("#schema-in-half").display = False
+        sql_panel = self.query_one("#sql-panel")
+        sql_panel.border_title = "SQL"
+        sql_panel.display = False
+        self.query_one("#sql-preview", Static).update(
+            Text("← Select an expression to view its SQL", style="dim")
+        )
+        self.query_one("#lineage-panel").border_title = "Lineage"
+        self.query_one("#lineage-content", Static).update(
+            Text("← Select an expression", style="dim")
+        )
+        self.query_one("#revisions-panel").border_title = "Revisions"
+        self.query_one("#revisions-panel").display = options.tui.revisions_open
+
+        git_log_panel = self.query_one("#git-log-panel")
+        git_log_panel.border_title = "Git Log"
+        git_log_panel.display = options.tui.git_log_open
+
+        self.query_one("#left-column").styles.width = f"{options.tui.left_ratio}fr"
+        self.query_one("#right-column").styles.width = f"{options.tui.right_ratio}fr"
+
+        data_panel = self.query_one("#data-preview-panel")
+        data_panel.border_title = "Data Preview"
+        data_panel.display = False
+
+        self.query_one("#status-bar", Static).update(" Loading catalog...")
+
+        self.set_interval(self._refresh_interval, self._do_refresh)
+
+    # --- Tree node selection ---
+
+    @on(Tree.NodeHighlighted, "#catalog-tree")
+    def _on_tree_node_highlighted(self, event: Tree.NodeHighlighted) -> None:
+        # Debounce: rapid j/k traversal fires NodeHighlighted per intermediate
+        # node.  Defer the synchronous panel render until the cursor settles so
+        # holding a key moves at terminal-repeat-rate.  _render_highlighted_node
+        # reads the tree's current cursor_node, so only the settled selection
+        # is rendered (XOR-306).
+        self._cancel_highlight_timer()
+        delay = options.tui.highlight_debounce
+        if delay <= 0:
+            self._render_highlighted_node()
+        else:
+            self._highlight_timer = self.set_timer(delay, self._render_highlighted_node)
+
+    def _cancel_highlight_timer(self) -> None:
+        if self._highlight_timer is not None:
+            self._highlight_timer.stop()
+            self._highlight_timer = None
+
+    def on_unmount(self) -> None:
+        # Screen dismissed while a debounce timer is pending (e.g. `q` within
+        # the debounce window of a cursor move) would otherwise fire
+        # _render_highlighted_node against removed widgets -> NoMatches.
+        self._cancel_highlight_timer()
+
+    def _render_highlighted_node(self) -> None:
+        self._highlight_timer = None
+        # A queued timer callback can still fire after on_unmount stopped the
+        # timer; querying removed widgets would raise NoMatches.
+        if not self.is_attached:
+            return
+        # Add Alias is a dynamic binding, visible only on an entry leaf. Refresh
+        # once per settled selection rather than per intermediate j/k node, so a
+        # held key does not trigger a Footer recompose at terminal-repeat-rate.
+        self.refresh_bindings()
+        # Clear panels first so an emptied tree (cursor_node None) doesn't leave
+        # the prior selection's content stranded on screen.
+        schema_in_table = self.query_one("#schema-in-table", DataTable)
+        schema_in_table.clear()
+        schema_out_table = self.query_one("#schema-preview-table", DataTable)
+        schema_out_table.clear()
+        lineage_content = self.query_one("#lineage-content", Static)
+        rev_table = self.query_one("#revisions-preview-table", DataTable)
+        rev_table.clear()
+
+        tree = self.query_one("#catalog-tree", Tree)
+        node = tree.cursor_node
+        # Branch nodes (kind groupings) have children; only leaf nodes are entries
+        entry_hash = node.data if node is not None else None
+        row_data = (
+            self._row_cache.get(entry_hash)
+            if node is not None and not node.children and entry_hash is not None
+            else None
+        )
+        if row_data is None:
+            self._current_sql_hash = None
+            self.query_one("#sql-preview", Static).update("")
+            lineage_content.update("")
+            self._lineage_rows = ()
+            self.query_one("#schema-in-half").display = False
+            self.query_one("#revisions-panel").border_title = "Revisions"
+            return
+
+        # Schema
+        schema_panel = self.query_one("#schema-panel")
+        match row_data.schema_in:
+            case None:
+                self.query_one("#schema-in-half").display = False
+                schema_panel.border_title = "Schema"
+                schema_panel.border_subtitle = f"{len(row_data.schema_out)} cols"
+            case schema_in:
+                self.query_one("#schema-in-half").display = True
+                schema_panel.border_title = "Schemas"
+                schema_panel.border_subtitle = (
+                    f"{len(schema_in)} in · {len(row_data.schema_out)} out"
+                )
+                for name, dtype in schema_in:
+                    schema_in_table.add_row(name, dtype)
+        for name, dtype in row_data.schema_out:
+            schema_out_table.add_row(name, dtype)
+
+        # Lineage panel: cheap (metadata only), so render regardless of view.
+        self._render_lineage_panel(row_data)
+
+        # SQL and data previews both cost a worker, so only the active view pays
+        # for them; switching views renders the current selection on demand.
+        match self._active_view:
+            case "sql":
+                self._refresh_sql_preview(row_data)
+            case "data":
+                self._refresh_data_preview(row_data)
+            case _:
+                pass
+
+        # Revisions preview
+        match row_data.aliases:
+            case (first_alias, *_):
+                catalog_alias = next(
+                    (ca for ca in self.catalog_aliases if ca.alias == first_alias),
+                    None,
+                )
+                match catalog_alias:
+                    case None:
+                        self.query_one(
+                            "#revisions-panel"
+                        ).border_title = "Revisions — (alias not found)"
+                    case _:
+                        self.query_one(
+                            "#revisions-panel"
+                        ).border_title = f"Revisions — {first_alias}"
+                        self._load_revisions_preview(catalog_alias)
+            case _:
+                self.query_one(
+                    "#revisions-panel"
+                ).border_title = "Revisions — (no alias)"
+
+    def _tree_entry_hashes(self) -> set[str]:
+        """Return set of entry hashes currently in the tree."""
+        tree = self.query_one("#catalog-tree", Tree)
+        return {
+            node.data
+            for branch in tree.root.children
+            for node in branch.children
+            if node.data is not None
+        }
+
+    # --- Refresh ---
+
+    @work(thread=True, exit_on_error=False)
+    def _do_refresh(self) -> None:
+        if not self._refresh_lock.acquire(blocking=False):
+            return
+        try:
+            self._do_refresh_locked()
+        finally:
+            self._refresh_lock.release()
+
+    @property
+    def catalog_aliases(self) -> tuple:
+        catalog = self.app._catalog
+        if catalog is None:
+            return ()
+        return _get_catalog_aliases(catalog)
+
+    def _do_refresh_locked(self) -> None:
+        catalog = self.app._catalog
+        if catalog is None:
+            return
+        repo_path = catalog.repo.working_dir
+        expected_keys = frozenset(_get_catalog_list(catalog))
+        alias_multimap = _build_alias_multimap(self.catalog_aliases)
+
+        # Reconcile alias changes on already-cached rows: an alias can land
+        # after its entry was first cached (add writes the entry to
+        # catalog.yaml before the alias, so a refresh can see the gap) or be
+        # re-pointed to a different entry later.  Do this before cached_rows
+        # is snapshotted so a full re-render also picks up the new aliases.
+        alias_changed = {
+            k: evolve(row, aliases=aliases)
+            for k, row in self._row_cache.items()
+            if (aliases := alias_multimap.get(k, ())) != row.aliases
+        }
+        self._row_cache.update(alias_changed)
+
+        # Age out: keys that were pink last cycle turn green now
+        prev_new = self._new_keys
+        self._new_keys = set()
+
+        # preserve insertion order from _row_cache (dict is ordered in Python 3.7+)
+        cached_rows = tuple(
+            self._row_cache[k] for k in self._row_cache if k in expected_keys
+        )
+        new_keys = expected_keys - self._row_cache.keys()
+        removed = self._row_cache.keys() - expected_keys
+
+        # evict removed entries
+        self._row_cache = {
+            k: v for k, v in self._row_cache.items() if k in expected_keys
+        }
+
+        # Track new keys for pink highlighting (skip first load — everything is new)
+        if cached_rows:
+            self._new_keys = set(new_keys)
+
+        if prev_new:
+            self.app.call_from_thread(self._relabel_leaves, prev_new)
+
+        match (bool(removed), bool(cached_rows)):
+            case (True, _) | (_, False):
+                # re-render when rows were removed or on first refresh
+                self.app.call_from_thread(self._render_refresh, repo_path, cached_rows)
+            case _:
+                pass
+
+        if alias_changed:
+            self.app.call_from_thread(self._apply_alias_changes, set(alias_changed))
+
+        # load new entries incrementally (expensive I/O, off the main thread)
+        for entry_hash in new_keys:
+            entry = catalog.get_catalog_entry(entry_hash)
+            aliases = alias_multimap.get(entry_hash, ())
+            row_data = _load_catalog_row(entry, aliases)
+            self._row_cache[row_data.row_key] = row_data
+            self.app.call_from_thread(self._render_catalog_row, row_data)
+
+        if self._git_log_visible:
+            git_rows = _build_git_log_rows(catalog.repo)
+            self.app.call_from_thread(self._render_git_log, git_rows)
+
+        stamp = datetime.now().strftime("%H:%M:%S")
+        self.app.call_from_thread(self._render_status, stamp, repo_path)
+
+    def _render_refresh(self, repo_path, cached_rows) -> None:
+        with self.app.batch_update():
+            catalog_name = Path(repo_path).name
+            self.query_one(
+                "#catalog-panel"
+            ).border_title = f"Expressions — {catalog_name}"
+
+            tree = self.query_one("#catalog-tree", Tree)
+            saved_line = tree.cursor_line
+            tree.clear()
+
+            # Group rows by kind
+            groups: dict[str, list[CatalogRowData]] = {}
+            for row_data in cached_rows:
+                groups.setdefault(row_data.kind, []).append(row_data)
+
+            # Add branches in KIND_ORDER, then any remaining kinds
+            for kind in (*KIND_ORDER, *(k for k in groups if k not in KIND_ORDER)):
+                if kind not in groups:
+                    continue
+                entries = groups[kind]
+                branch = tree.root.add(
+                    _styled_branch_label(kind, len(entries)), data=kind
+                )
+                branch.expand()
+                for row_data in entries:
+                    branch.add_leaf(
+                        self._styled_leaf_label(row_data), data=row_data.row_key
+                    )
+
+            # Restore approximate cursor position
+            total = sum(1 + len(b.children) for b in tree.root.children)
+            if total > 0:
+                tree.cursor_line = min(saved_line, total - 1)
+            self.refresh_bindings()
+
+    def _render_catalog_row(self, row_data) -> None:
+        with self.app.batch_update():
+            tree = self.query_one("#catalog-tree", Tree)
+            kind = row_data.kind
+
+            # Find or create the kind branch
+            branch = None
+            for child in tree.root.children:
+                if child.data == kind:
+                    branch = child
+                    break
+
+            if branch is None:
+                branch = tree.root.add(_styled_branch_label(kind, 1), data=kind)
+                branch.expand()
+            else:
+                count = len(branch.children) + 1
+                branch.set_label(_styled_branch_label(kind, count))
+
+            branch.add_leaf(self._styled_leaf_label(row_data), data=row_data.row_key)
+
+    def _styled_leaf_label(self, row_data: CatalogRowData) -> Text:
+        is_new = row_data.row_key in self._new_keys
+        cache_icon, cache_color = CACHE_STYLE[row_data.cached]
+        ncols = len(row_data.schema_out)
+        short_hash = row_data.hash[:12]
+
+        if is_new:
+            icon_style = f"bold {FLASH_NEW}"
+            name_style = f"bold {FLASH_NEW}"
+            hash_style = f"dim {FLASH_NEW}"
+            badge_style = f"dim {FLASH_NEW}"
+        else:
+            icon_style = cache_color
+            name_style = f"bold {XORQ_DARK.primary}"
+            hash_style = f"dim {SUBDUED}"
+            badge_style = "dim"
+
+        label = Text()
+        label.append(f"{cache_icon} ", style=icon_style)
+        if row_data.aliases_display:
+            label.append(row_data.aliases_display, style=name_style)
+            label.append(f" {short_hash}", style=hash_style)
+        else:
+            label.append(short_hash, style=name_style if is_new else XORQ_DARK.primary)
+        label.append(f" ·{ncols}", style=badge_style)
+        return label
+
+    def _relabel_leaves(self, keys: set[str]) -> None:
+        tree = self.query_one("#catalog-tree", Tree)
+        for branch in tree.root.children:
+            for leaf in branch.children:
+                if leaf.data in keys and leaf.data in self._row_cache:
+                    leaf.set_label(self._styled_leaf_label(self._row_cache[leaf.data]))
+
+    def _apply_alias_changes(self, keys: set[str]) -> None:
+        self._relabel_leaves(keys)
+        # If the cursor sits on an affected entry, the side panels (Revisions
+        # title, Lineage) were rendered from the stale aliases; re-render them.
+        tree = self.query_one("#catalog-tree", Tree)
+        node = tree.cursor_node
+        if node is not None and node.data in keys:
+            self._render_highlighted_node()
+
+    def _render_status(self, stamp, repo_path) -> None:
+        rows = self._row_cache.values()
+        count = len(self._row_cache)
+        kind_counts = Counter(r.kind for r in rows)
+        cached_count = sum(1 for r in rows if r.cached)
+        kinds_str = ", ".join(
+            f"{kind_counts[k]} {k}" for k in KIND_ORDER if k in kind_counts
+        )
+        header = f" {count} entries" + (f" ({kinds_str})" if kinds_str else "")
+        parts = [header]
+        if cached_count:
+            parts.append(f"{cached_count} cached")
+        parts.append(str(repo_path))
+        parts.append(stamp)
+        self.query_one("#status-bar", Static).update(" · ".join(parts))
+
+    # --- SQL preview worker ---
+
+    @work(thread=True, exit_on_error=False, exclusive=True, group="sql_render")
+    def _load_sql_preview(
+        self,
+        entry_hash: str,
+        raw: str | SqlQueries,
+    ) -> None:
+        try:
+            if not isinstance(raw, str):
+                raw = _render_sql_dag(raw)
+            rich_text = _render_sql_text(raw)
+        except Exception:
+            logger.exception("sql_preview_render_failed", entry_hash=entry_hash)
+            rich_text = Text("(render error)", style="dim")
+
+        def _apply():
+            if not self.is_attached or self._current_sql_hash != entry_hash:
+                return
+            self.query_one("#sql-preview", Static).update(rich_text)
+
+        self.app.call_from_thread(_apply)
+
+    # --- Toggle: Git Log ---
+
+    def action_toggle_git_log(self) -> None:
+        self._git_log_visible = not self._git_log_visible
+        self.query_one("#git-log-panel").display = self._git_log_visible
+        if self._git_log_visible and not self._git_log_loaded:
+            self._load_git_log()
+
+    @work(thread=True)
+    def _load_git_log(self) -> None:
+        catalog = self.app._catalog
+        if catalog is None:
+            return
+        rows = _build_git_log_rows(catalog.repo)
+        self._git_log_loaded = True
+        self.app.call_from_thread(self._render_git_log, rows)
+
+    def _render_git_log(self, rows) -> None:
+        with self.app.batch_update():
+            table = self.query_one("#git-log-table", DataTable)
+            table.clear()
+            for i, row_data in enumerate(rows):
+                table.add_row(*row_data.row, key=str(i))
+
+    # --- View switching (1/2/3) ---
+
+    def _set_active_view(self, view: Literal["lineage", "sql", "data"]) -> None:
+        self._active_view = view
+        self.query_one("#lineage-panel").display = view == "lineage"
+        self.query_one("#sql-panel").display = view == "sql"
+        self.query_one("#data-preview-panel").display = view == "data"
+
+        # The inactive views' dedup guards are cleared so re-entering a view
+        # re-renders the selection that changed while it was hidden.
+        if view != "data":
+            self._data_preview_hash = None
+        if view != "sql":
+            self._current_sql_hash = None
+        if view == "lineage":
+            return
+
+        row_data = self._selected_row_data()
+        if row_data is None:
+            return
+        if view == "sql":
+            self._refresh_sql_preview(row_data)
+        else:
+            self._refresh_data_preview(row_data)
+
+    def action_view_lineage(self) -> None:
+        self._set_active_view("lineage")
+
+    # --- Lineage panel: fold state and cursor (l / h / j / k) ---
+
+    def _lineage_focused(self) -> bool:
+        """Whether the fold keys and the row cursor are live.
+
+        Gated on focus because `h`/`l`/`j`/`k` already drive the entries tree:
+        the panel has to own them before it can fold anything.
+        """
+        return self.is_mounted and self.app.focused is self.query_one("#lineage-panel")
+
+    def _render_lineage_panel(
+        self, row_data: CatalogRowData, keep_node: str | None = None
+    ) -> None:
+        """Draw the panel for *row_data* and remember its rows for the cursor.
+
+        *keep_node* re-seats the cursor on that node's row after a fold changed
+        the row set: expanding a node inserts the ops above it, so the row the
+        cursor sat on moves down, and the user expects to still be on it.
+        """
+        expanded = self._lineage_expanded.get(row_data.row_key, frozenset())
+        rows = row_data.lineage_lines(expanded)
+        self._lineage_rows = rows
+        cursor = self._lineage_cursor.get(row_data.row_key, 0)
+        if keep_node is not None:
+            # First occurrence: a node repeated as `↻` renders in full only once.
+            cursor = next(
+                (i for i, row in enumerate(rows) if row.node_id == keep_node), cursor
+            )
+        cursor = min(max(cursor, 0), max(len(rows) - 1, 0))
+        self._lineage_cursor[row_data.row_key] = cursor
+        self.query_one("#lineage-content", Static).update(
+            row_data.lineage_panel_rich(
+                expanded, cursor if self._lineage_focused() else None
+            )
+        )
+
+    def _lineage_cursor_row(self) -> "LineageRow | None":
+        """The row the fold keys act on, or None when the panel has no rows."""
+        row_data = self._selected_row_data()
+        if row_data is None or not self._lineage_rows:
+            return None
+        cursor = self._lineage_cursor.get(row_data.row_key, 0)
+        if not 0 <= cursor < len(self._lineage_rows):
+            return None
+        return self._lineage_rows[cursor]
+
+    def _move_lineage_cursor(self, direction: int) -> None:
+        # The cursor is a row, not a node: a node can render on more than one row
+        # (`↻` pointers, a shared node in the compact tree), so an id would be
+        # ambiguous here and the cursor would jump back to the first occurrence.
+        row_data = self._selected_row_data()
+        rows = self._lineage_rows
+        if row_data is None or not rows:
+            return
+        cursor = self._lineage_cursor.get(row_data.row_key, 0)
+        target = min(max(cursor + direction, 0), len(rows) - 1)
+        self._lineage_cursor[row_data.row_key] = target
+        self._render_lineage_panel(row_data)
+        self._scroll_lineage_cursor(row_data, target)
+
+    def _scroll_lineage_cursor(self, row_data: CatalogRowData, row_index: int) -> None:
+        """Keep the cursor row inside the panel's viewport.
+
+        The panel is one Static, so Textual has no per-row region to scroll to:
+        the y offset is counted off the rendered lines above the cursor row.
+        The content folds (`overflow="fold"`), so a long Hash or label takes one
+        display line per panel-width of cells, not one per source line.
+        """
+        panel = self.query_one("#lineage-panel", VerticalScroll)
+        height = panel.content_size.height
+        if height <= 0:
+            return
+        expanded = self._lineage_expanded.get(row_data.row_key, frozenset())
+        lines = row_data.lineage_panel_text(expanded).split("\n")
+        width = self.query_one("#lineage-content", Static).content_size.width
+        y = sum(
+            max(1, math.ceil(cell_len(line) / width)) if width > 0 else 1
+            for line in lines[: row_index + LINEAGE_TREE_OFFSET]
+        )
+        top = panel.scroll_offset.y
+        if y < top:
+            panel.scroll_to(y=y, animate=False)
+        elif y >= top + height:
+            panel.scroll_to(y=y - height + 1, animate=False)
+
+    def action_lineage_expand(self) -> None:
+        """`]`: list the columns of the node under the lineage cursor."""
+        if self._lineage_focused():
+            self._toggle_lineage_expand(True)
+
+    def action_lineage_collapse(self) -> None:
+        """`[`: fold those columns away again."""
+        if self._lineage_focused():
+            self._toggle_lineage_expand(False)
+
+    def _toggle_lineage_expand(self, expand: bool) -> None:
+        row_data = self._selected_row_data()
+        row = self._lineage_cursor_row()
+        if row_data is None or row is None or row.node_id is None:
+            return
+        key = row_data.row_key
+        # A column row carries its owner's id, so `[` on one folds the node it
+        # came from -- which is the node the user is looking at.
+        node_id = row.node_id
+        expanded = self._lineage_expanded.get(key, frozenset())
+        if expand:
+            # No schema stored at this node: `]` is a no-op, as the missing marker
+            # already says.
+            if node_id not in row_data.lineage_expandable or node_id in expanded:
+                return
+            expanded = expanded | {node_id}
+        else:
+            if node_id not in expanded:
+                return
+            expanded = expanded - {node_id}
+        self._lineage_expanded[key] = expanded
+        self._render_lineage_panel(row_data, keep_node=node_id)
+
+    def action_view_sql(self) -> None:
+        self._set_active_view("sql")
+
+    def action_view_data(self) -> None:
+        self._set_active_view("data")
+
+    def _refresh_sql_preview(self, row_data: CatalogRowData) -> None:
+        if self._current_sql_hash == row_data.row_key:
+            return
+        sql_preview = self.query_one("#sql-preview", Static)
+        sql_panel = self.query_one("#sql-panel")
+        match row_data.sqls:
+            case ():
+                self._current_sql_hash = None
+                sql_preview.update("(SQL unavailable)")
+                sql_panel.border_subtitle = ""
+            case ((_, engine, sql, _),):
+                sql_panel.border_subtitle = engine
+                self._current_sql_hash = row_data.row_key
+                sql_preview.update(Text("Rendering SQL Query…", style="dim"))
+                self._load_sql_preview(row_data.row_key, sql)
+            case sqls:
+                engines = sorted({engine for _, engine, _, _ in sqls})
+                sql_panel.border_subtitle = (
+                    f"{len(sqls)} queries · {', '.join(engines)}"
+                )
+                self._current_sql_hash = row_data.row_key
+                sql_preview.update(Text("Rendering SQL Query…", style="dim"))
+                self._load_sql_preview(row_data.row_key, sqls)
+
+    def _refresh_data_preview(self, row_data: CatalogRowData) -> None:
+        entry_hash = row_data.row_key
+        if self._data_preview_hash == entry_hash:
+            return
+        self._data_preview_hash = entry_hash
+        if row_data.cached is True:
+            self.query_one("#data-preview-status", Static).update(
+                " Loading data preview..."
+            )
+            self.query_one("#data-preview-table", DataTable).loading = True
+            self._load_data_preview(row_data.entry)
+        else:
+            self.query_one("#data-preview-status", Static).update(
+                " uncached — run to materialize"
+            )
+            dt = self.query_one("#data-preview-table", DataTable)
+            dt.clear(columns=True)
+            dt.loading = False
+
+    # --- Toggle: Revisions (v) ---
+
+    def action_toggle_revisions(self) -> None:
+        panel = self.query_one("#revisions-panel")
+        panel.display = not panel.display
+
+    # --- Data Preview (worker) ---
+
+    @work(thread=True, exit_on_error=False)
+    def _load_data_preview(self, entry) -> None:
+        try:
+            df = entry.expr.head(50).execute()
+            columns = tuple(str(c) for c in df.columns)
+            rows = tuple(
+                tuple(str(round(v, 2)) if isinstance(v, float) else str(v) for v in row)
+                for row in df.itertuples(index=False)
+            )
+            total_rows = len(df)
+            self.app.call_from_thread(
+                self._render_data_preview, columns, rows, total_rows
+            )
+        except Exception as e:
+            self.app.call_from_thread(self._render_data_preview_error, str(e))
+
+    def _render_data_preview(self, columns, rows, total_rows) -> None:
+        with self.app.batch_update():
+            self.query_one("#data-preview-status", Static).update(
+                f" Data Preview — {total_rows} rows (max 50)"
+            )
+            data_table = self.query_one("#data-preview-table", DataTable)
+            data_table.clear(columns=True)
+            data_table.loading = False
+            for col in columns:
+                data_table.add_column(col, key=col)
+            for i, row in enumerate(rows):
+                data_table.add_row(*row, key=str(i))
+            data_table.cursor_type = "row"
+
+    def _render_data_preview_error(self, message) -> None:
+        self.query_one("#data-preview-status", Static).update(f" Error: {message}")
+        self.query_one("#data-preview-table", DataTable).loading = False
+
+    # --- Revisions Preview ---
+
+    @work(thread=True, exit_on_error=False, exclusive=True, group="revisions")
+    def _load_revisions_preview(self, catalog_alias) -> None:
+        try:
+            head_sha = catalog_alias.catalog_entry.catalog.repo.head.commit.hexsha
+            raw_revisions = _list_revisions_cached(catalog_alias, head_sha)
+        except (KeyError, ValueError, OSError, AttributeError):
+            return
+        revision_rows = tuple(
+            row
+            for i, (rev_entry, commit) in enumerate(raw_revisions)
+            for row, _ in (_revision_pair(i, rev_entry, commit),)
+        )
+        self.app.call_from_thread(self._render_revisions_preview, revision_rows)
+
+    def _render_revisions_preview(self, revision_rows) -> None:
+        with self.app.batch_update():
+            rev_table = self.query_one("#revisions-preview-table", DataTable)
+            rev_table.clear()
+            for i, row_data in enumerate(revision_rows):
+                rev_table.add_row(*row_data.row, key=str(i))
+            rev_panel = self.query_one("#revisions-panel")
+            rev_panel.border_subtitle = f"{len(revision_rows)} revisions"
+
+    # --- Navigation ---
+
+    def action_tree_collapse(self) -> None:
+        """h: collapse branch in tree, scroll left in a DataTable."""
+        focused = self.app.focused
+        tree = self.query_one("#catalog-tree", Tree)
+        if focused is tree:
+            node = tree.cursor_node
+            if node is not None:
+                if node.children and node.is_expanded:
+                    node.collapse()
+                elif node.parent is not None and node.parent is not tree.root:
+                    tree.select_node(node.parent)
+                    node.parent.collapse()
+        elif isinstance(focused, DataTable):
+            focused.action_scroll_left()
+
+    def action_cursor_down(self) -> None:
+        focused = self.app.focused
+        tree = self.query_one("#catalog-tree", Tree)
+        if focused is tree:
+            tree.action_cursor_down()
+        elif isinstance(focused, DataTable):
+            focused.action_cursor_down()
+        elif self._lineage_focused():
+            self._move_lineage_cursor(1)
+        elif isinstance(focused, VerticalScroll):
+            focused.scroll_down()
+
+    def action_cursor_up(self) -> None:
+        focused = self.app.focused
+        tree = self.query_one("#catalog-tree", Tree)
+        if focused is tree:
+            tree.action_cursor_up()
+        elif isinstance(focused, DataTable):
+            focused.action_cursor_up()
+        elif self._lineage_focused():
+            self._move_lineage_cursor(-1)
+        elif isinstance(focused, VerticalScroll):
+            focused.scroll_up()
+
+    def action_tree_expand(self) -> None:
+        """l: expand branch in tree, scroll right in a DataTable."""
+        focused = self.app.focused
+        tree = self.query_one("#catalog-tree", Tree)
+        if focused is tree:
+            node = tree.cursor_node
+            if node is not None:
+                if node.children and not node.is_expanded:
+                    node.expand()
+                elif node.children and node.is_expanded:
+                    first_child = node.children[0]
+                    tree.select_node(first_child)
+        elif isinstance(focused, DataTable):
+            focused.action_scroll_right()
+
+    def action_focus_next_panel(self) -> None:
+        self._cycle_focus(1)
+
+    def action_focus_prev_panel(self) -> None:
+        self._cycle_focus(-1)
+
+    def _cycle_focus(self, direction: int) -> None:
+        visible = tuple(
+            sel for sel in self.FOCUS_CYCLE if self.query_one(sel).display is not False
+        )
+        if not visible:
+            return
+        current = self.app.focused
+        current_idx = next(
+            (
+                i
+                for i, sel in enumerate(visible)
+                if current is self.query_one(sel)
+                or (
+                    isinstance(current, (DataTable, Tree))
+                    and current.parent is not None
+                    and current.parent is self.query_one(sel).parent
+                )
+            ),
+            0,
+        )
+        next_idx = (current_idx + direction) % len(visible)
+        self.query_one(visible[next_idx]).focus()
+
+    def action_open_data_view(self) -> None:
+        row_data = self._selected_row_data()
+        if row_data is None or row_data.kind == "unbound_expr":
+            return
+        self.app.push_screen(DataViewScreen(entry=row_data.entry, row_data=row_data))
+
+    def _selected_row_data(self) -> CatalogRowData | None:
+        tree = self.query_one("#catalog-tree", Tree)
+        node = tree.cursor_node
+        if node is None or node.children:
+            return None
+        return self._row_cache.get(node.data)
+
+    def _tree_action_row(self) -> CatalogRowData | None:
+        # Single source of truth for the row-targeting actions (add/remove
+        # alias, delete): return the selected row only while the entries tree
+        # is focused and a leaf is selected, else None.  Otherwise the key
+        # bubbles up from another panel and acts on a stale tree cursor.
+        if not self.is_mounted:
+            return None
+        tree = self.query_one("#catalog-tree", Tree)
+        if self.app.focused is not tree:
+            return None
+        return self._selected_row_data()
+
+    def _tree_action_available(self) -> bool:
+        return self._tree_action_row() is not None
+
+    def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
+        if action in ("add_alias", "remove_alias", "delete_entry"):
+            return self._tree_action_available()
+        if action in ("lineage_expand", "lineage_collapse"):
+            # None hides the binding: the fold keys only mean anything while the
+            # Lineage panel has focus, so that is the only time they are offered.
+            return True if self._lineage_focused() else None
+        return super().check_action(action, parameters)
+
+    def on_descendant_focus(self) -> None:
+        self.refresh_bindings()
+        # The lineage cursor is only drawn while its panel holds focus, so the
+        # panel is re-rendered whenever focus lands on or leaves it.
+        row_data = self._selected_row_data()
+        if row_data is not None and self._lineage_rows:
+            self._render_lineage_panel(row_data)
+
+    def action_delete_entry(self) -> None:
+        row_data = self._tree_action_row()
+        if row_data is None:
+            return
+        self.app.push_screen(
+            DeleteEntryScreen(row_data),
+            lambda confirmed: self._delete_entry(row_data.hash) if confirmed else None,
+        )
+
+    def action_add_entry(self) -> None:
+        self.app.push_screen(
+            AddEntryScreen(),
+            lambda request: self._add_entry(*request) if request is not None else None,
+        )
+
+    def action_add_alias(self) -> None:
+        row_data = self._tree_action_row()
+        if row_data is None:
+            return
+        self.app.push_screen(
+            AddAliasScreen(row_data),
+            lambda alias: (
+                self._add_alias(row_data.hash, alias) if alias is not None else None
+            ),
+        )
+
+    def action_remove_alias(self) -> None:
+        row_data = self._tree_action_row()
+        if row_data is None:
+            return
+        if not row_data.aliases:
+            self.app.notify(
+                "The selected entry has no aliases.",
+                title="Remove Alias",
+                severity="warning",
+            )
+            return
+        self.app.push_screen(
+            RemoveAliasScreen(row_data),
+            lambda alias: self._remove_alias(alias) if alias is not None else None,
+        )
+
+    def _run_locked_mutation(
+        self,
+        mutate: Callable[[Catalog], object],
+        *,
+        log_event: str,
+        log_kwargs: dict[str, str],
+        title: str,
+        verb: str,
+        success: Callable[[object], str],
+    ) -> None:
+        # Shared body for the catalog-mutation workers: guard the async-loaded
+        # catalog, run `mutate` under the refresh lock, and always re-render the
+        # view (success or failure) before notifying.  `success` maps the
+        # mutation's return value to the confirmation message.
+        catalog = self.app._catalog  # xorq-style: disable=protected-access
+        if catalog is None:
+            return
+        with self._refresh_lock:
+            try:
+                result = mutate(catalog)
+            except CatalogPushError as exc:
+                # The local commit already happened (synchronizing() commits
+                # before pushing); only the remote push failed.  Re-render --
+                # the change IS applied locally -- and warn about the
+                # local/remote divergence rather than framing it as a total
+                # failure the user would expect to have left no trace.
+                logger.exception(log_event, **log_kwargs)
+                self._do_refresh_locked()
+                self.app.call_from_thread(
+                    self.app.notify,
+                    f"{verb} applied locally but remote push failed: {exc}",
+                    title=title,
+                    severity="warning",
+                    timeout=8,
+                )
+                return
+            except Exception as exc:
+                logger.exception(log_event, **log_kwargs)
+                self._do_refresh_locked()
+                self.app.call_from_thread(
+                    self.app.notify,
+                    f"{verb} failed: {exc}",
+                    title=title,
+                    severity="error",
+                    timeout=6,
+                )
+                return
+            self._do_refresh_locked()
+        self.app.call_from_thread(
+            self.app.notify,
+            success(result),
+            title=title,
+            severity="information",
+        )
+
+    @work(thread=True, exit_on_error=False, exclusive=True, group="catalog_mutation")
+    def _add_entry(self, build_dir_path: str, alias: str | None) -> None:
+        path = Path(build_dir_path).expanduser()
+
+        def mutate(catalog):
+            if not path.is_dir():
+                raise ValueError(f"build path is not a directory: {path}")
+            return catalog.add(
+                path,
+                aliases=(alias,) if alias else (),
+                project_path=_find_project_path(path),
+            )
+
+        self._run_locked_mutation(
+            mutate,
+            log_event="catalog_entry_add_failed",
+            log_kwargs={"build_dir_path": str(path)},
+            title="Add Entry",
+            verb="Add",
+            success=lambda entry: f"Added {entry.name[:12]}",
+        )
+
+    @work(thread=True, exit_on_error=False, exclusive=True, group="catalog_mutation")
+    def _add_alias(self, entry_hash: str, alias: str) -> None:
+        self._run_locked_mutation(
+            lambda catalog: catalog.add_alias(entry_hash, alias),
+            log_event="catalog_alias_add_failed",
+            log_kwargs={"entry_hash": entry_hash, "alias": alias},
+            title="Add Alias",
+            verb="Add",
+            success=lambda _: f"Added alias {alias!r}",
+        )
+
+    @work(thread=True, exit_on_error=False, exclusive=True, group="catalog_mutation")
+    def _delete_entry(self, entry_hash: str) -> None:
+        self._run_locked_mutation(
+            lambda catalog: catalog.remove(entry_hash),
+            log_event="catalog_entry_delete_failed",
+            log_kwargs={"entry_hash": entry_hash},
+            title="Delete Entry",
+            verb="Delete",
+            success=lambda _: f"Deleted {entry_hash[:12]}",
+        )
+
+    @work(thread=True, exit_on_error=False, exclusive=True, group="catalog_mutation")
+    def _remove_alias(self, alias: str) -> None:
+        self._run_locked_mutation(
+            lambda catalog: catalog.remove_alias(alias),
+            log_event="catalog_alias_remove_failed",
+            log_kwargs={"alias": alias},
+            title="Remove Alias",
+            verb="Remove",
+            success=lambda _: f"Removed alias {alias!r}",
+        )
+
+    def action_quit_app(self) -> None:
+        self.app.exit()
+
+
+class DataViewScreen(Screen):
+    """Full-screen data viewer with interactive expression composition.
+
+    Column-level verbs (sort, drop) and a freeform `:` prompt each push an
+    Ibis call onto an undo/redo ExprStack; the full chain is re-evaluated via
+    ``xorq catalog run -c`` on every change.
+    """
+
+    BINDINGS = (
+        Binding("escape", "cancel_or_back", "Back"),
+        Binding("q", "cancel_or_back", "Back", show=False),
+        Binding("h", "cursor_left", "Col ←", show=False),
+        Binding("j", "cursor_down", "Down", show=False),
+        Binding("k", "cursor_up", "Up", show=False),
+        Binding("l", "cursor_right", "Col →", show=False),
+        Binding("g", "scroll_top", "Top", show=False),
+        Binding("shift+g", "scroll_bottom", "Bottom", show=False),
+        Binding("[", "sort_desc", "Sort ↓", show=False),
+        Binding("]", "sort_asc", "Sort ↑", show=False),
+        Binding("d", "drop_column", "Drop"),
+        Binding("u", "undo", "Undo"),
+        Binding("ctrl+r", "redo", "Redo"),
+        Binding("s", "toggle_stack_browser", "Stack"),
+        Binding("w", "persist", "Save"),
+        Binding(":", "open_freeform", "Expr"),
+    )
+
+    def __init__(self, entry, row_data):
+        super().__init__()
+        self._entry = entry
+        self._row_data = row_data
+        self._stack = None
+        self._df = None
+        self._cursor_column_index = 0
+        self._stack_browser_visible = False
+        self._command_mode = None
+        self._active_proc = None
+        self._proc_lock = threading.Lock()
+
+    def compose(self) -> ComposeResult:
+        yield Header(show_clock=False)
+        yield Static("", id="data-view-status")
+        with Horizontal(id="data-view-split"):
+            yield DataTable(id="data-view-table")
+            with Vertical(id="stack-browser-panel"):
+                yield Static("", id="stack-browser-content")
+        yield Input(id="command-input", placeholder="")
+        yield Footer()
+
+    def on_mount(self) -> None:
+        table = self.query_one("#data-view-table", DataTable)
+        table.cursor_type = "cell"
+        table.zebra_stripes = True
+        table.loading = True
+
+        stack_panel = self.query_one("#stack-browser-panel")
+        stack_panel.border_title = "Expression Stack"
+        stack_panel.display = False
+
+        cmd_input = self.query_one("#command-input", Input)
+        cmd_input.display = False
+
+        label = self._row_data.aliases_display or self._row_data.hash[:12]
+        self.query_one("#data-view-status", Static).update(f" Loading {label}...")
+        self._load_data()
+
+    def on_unmount(self) -> None:
+        self._kill_active_proc()
+
+    def _catalog_base_cmd(self, subcommand: str) -> list[str]:
+        """Shared ``xorq catalog --path <repo> <subcommand> <entry>`` prefix."""
+        catalog = self.app._catalog
+        entry_name = (
+            self._row_data.aliases[0] if self._row_data.aliases else self._entry.name
+        )
+        return [
+            "xorq",
+            "catalog",
+            "--path",
+            str(catalog.repo_path),
+            subcommand,
+            entry_name,
+        ]
+
+    def _catalog_run_cmd(self, code=None) -> list[str]:
+        """Build the xorq catalog run subprocess command."""
+        cmd = self._catalog_base_cmd("run") + [
+            "--limit",
+            str(options.tui.row_limit),
+            "-o",
+            "-",
+            "-f",
+            "arrow",
+        ]
+        if code:
+            cmd.extend(["-c", code])
+        return cmd
+
+    def _spawn_run(self, cmd):
+        with self._proc_lock:
+            prior = self._active_proc
+            if prior is not None and prior.poll() is None:
+                prior.kill()
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            self._active_proc = proc
+        try:
+            stdout, stderr = proc.communicate()
+        finally:
+            with self._proc_lock:
+                if self._active_proc is proc:
+                    self._active_proc = None
+        return proc.returncode, stdout, stderr
+
+    def _run_catalog_subprocess(self, code=None):
+        """Run xorq catalog run and return a pandas DataFrame.
+
+        Try `--use-this-venv` first; fall back to the uv-isolated path
+        on any failure.
+        """
+        import pyarrow as pa  # noqa: PLC0415
+
+        cmd = self._catalog_run_cmd(code)
+        fast_stderr = ""
+        try:
+            returncode, stdout, stderr = self._spawn_run([*cmd, "--use-this-venv"])
+            fast_stderr = stderr.decode(errors="replace").strip()
+            if returncode == 0:
+                return pa.ipc.open_stream(stdout).read_pandas()
+            logger.debug(
+                "catalog_run_fast_path_nonzero",
+                returncode=returncode,
+                stderr=fast_stderr[-500:],
+            )
+        except (OSError, pa.lib.ArrowException):
+            logger.exception(
+                "catalog_run_fast_path_failed",
+                stderr=fast_stderr,
+            )
+        returncode, stdout, stderr = self._spawn_run(cmd)
+        if returncode != 0:
+            raise RuntimeError(stderr.decode(errors="replace").strip())
+        return pa.ipc.open_stream(stdout).read_pandas()
+
+    def _kill_active_proc(self) -> None:
+        with self._proc_lock:
+            proc = self._active_proc
+        if proc is not None and proc.poll() is None:
+            proc.kill()
+
+    @work(thread=True, exit_on_error=False)
+    def _load_data(self) -> None:
+        entry_hash = self._row_data.hash[:12]
+        try:
+            self._stack = ExprStack(base_expr=self._entry)
+            df = self._run_catalog_subprocess()
+            self.app.call_from_thread(self._on_data_loaded, df)
+        except Exception as e:
+            logger.exception("data_view_load_failed", entry_hash=entry_hash)
+            self.app.call_from_thread(self._render_error, str(e))
+
+    def _on_data_loaded(self, df) -> None:
+        self._df = df
+        self._cursor_column_index = 0
+        self._render_table()
+        self._update_command_suggester()
+
+    def _render_table(self) -> None:
+        df = self._df
+        if df is None:
+            return
+        with self.app.batch_update():
+            table = self.query_one("#data-view-table", DataTable)
+            table.clear(columns=True)
+            table.loading = False
+            for col in df.columns:
+                table.add_column(str(col), key=str(col))
+            for i, row in enumerate(df.itertuples(index=False)):
+                table.add_row(
+                    *(
+                        "—"
+                        if isinstance(v, float) and math.isnan(v)
+                        else str(round(v, 2))
+                        if isinstance(v, float)
+                        else str(v)
+                        for v in row
+                    ),
+                    key=str(i),
+                )
+            table.cursor_type = "cell"
+            self._update_status_bar()
+
+    def _update_status_bar(self) -> None:
+        df = self._df
+        if df is None:
+            return
+        label = self._row_data.aliases_display or self._row_data.hash[:12]
+        stack = self._stack
+        step_info = ""
+        if stack and stack.cursor > 0:
+            step = stack.steps[stack.cursor - 1]
+            step_info = f" | step {stack.cursor}/{len(stack.steps)} {step.verb}"
+        col_info = ""
+        cols = df.columns
+        idx = self._cursor_column_index
+        if 0 <= idx < len(cols):
+            col_info = f" | [{cols[idx]}]"
+        self.query_one("#data-view-status", Static).update(
+            f" {label} \u2014 {len(df)} rows \u00d7 {len(cols)} cols{col_info}{step_info}"
+        )
+
+    def _render_error(self, message) -> None:
+        self.query_one("#data-view-status", Static).update(f" Error: {message}")
+        self.query_one("#data-view-table", DataTable).loading = False
+
+    def _update_command_suggester(self) -> None:
+        """Update tab-completion suggestions from current expression columns."""
+        cols = tuple(self._df.columns) if self._df is not None else ()
+        self.query_one("#command-input", Input).suggester = SuggestFromList(
+            cols + _ibis_table_method_names(), case_sensitive=False
+        )
+
+    # --- Stack operations ---
+
+    def _push_step(self, verb: str, user_input: str, code: str) -> None:
+        """Push a step and re-execute in background."""
+        step = ExprStep(verb=verb, user_input=user_input, code=code)
+        self._stack = self._stack.push(step)
+        self._execute_current()
+
+    @work(thread=True, exit_on_error=False, exclusive=True, group="execute_current")
+    def _execute_current(self) -> None:
+        """Evaluate current stack expression via subprocess."""
+        stack = self._stack
+        code = stack.current_code or None
+        try:
+            df = self._run_catalog_subprocess(code)
+        except Exception as e:
+            logger.exception(
+                "stack_execute_failed",
+                cursor=stack.cursor,
+                steps=len(stack.steps),
+                code=code[:500] + "..." if code and len(code) > 500 else code,
+            )
+            self.app.call_from_thread(self._on_stack_execute_failed, stack, str(e))
+            return
+        self.app.call_from_thread(self._on_stack_executed, stack, df)
+
+    def _on_stack_executed(self, stack, df) -> None:
+        if self._stack is not stack:
+            return
+        self._df = df
+        self._cursor_column_index = 0
+        self._render_table()
+        self._update_command_suggester()
+        self._render_stack_browser()
+
+    def _on_stack_execute_failed(self, stack, message) -> None:
+        if self._stack is not stack:
+            return
+        self._stack = stack.undo()
+        self._show_command_error(message)
+        self._render_stack_browser()
+
+    def _show_command_error(self, message) -> None:
+        self.app.notify(message, title="Error", severity="error", timeout=6)
+
+    # --- Command input ---
+
+    def _close_command_input(self) -> None:
+        self.query_one("#command-input", Input).display = False
+        self._command_mode = None
+        self.query_one("#data-view-table", DataTable).focus()
+
+    @on(Input.Submitted, "#command-input")
+    def _on_command_submitted(self, event: Input.Submitted) -> None:
+        user_input = event.value.strip()
+        mode = self._command_mode
+        self._close_command_input()
+
+        if mode == "save":
+            self._do_persist(user_input or None)
+        elif user_input:
+            self._push_step("freeform", user_input, user_input)
+
+    # --- Freeform action ---
+
+    def action_open_freeform(self) -> None:
+        if self._stack is None:
+            return
+        self._command_mode = "freeform"
+        cmd = self.query_one("#command-input", Input)
+        cmd.value = ""
+        cmd.placeholder = ":\u25b8 type expression, Tab to complete, Enter to apply"
+        cmd.border_title = ":\u25b8"
+        cmd.display = True
+        cmd.focus()
+
+    # --- Instant actions (no input required) ---
+
+    def action_sort_asc(self) -> None:
+        if self._stack is None or self._df is None:
+            return
+        col = self._df.columns[self._cursor_column_index]
+        code = f'source.order_by("{col}")'
+        self._push_step("order_by", f'"{col}"', code)
+
+    def action_sort_desc(self) -> None:
+        if self._stack is None or self._df is None:
+            return
+        col = self._df.columns[self._cursor_column_index]
+        code = f'source.order_by(ibis.desc("{col}"))'
+        self._push_step("order_by", f'ibis.desc("{col}")', code)
+
+    def action_drop_column(self) -> None:
+        if self._stack is None or self._df is None:
+            return
+        col = self._df.columns[self._cursor_column_index]
+        code = f'source.drop("{col}")'
+        self._push_step("drop", f'"{col}"', code)
+
+    # --- Undo / Redo ---
+
+    def action_undo(self) -> None:
+        if self._stack is None or not self._stack.can_undo:
+            return
+        self._stack = self._stack.undo()
+        self._execute_current()
+
+    def action_redo(self) -> None:
+        if self._stack is None or not self._stack.can_redo:
+            return
+        self._stack = self._stack.redo()
+        self._execute_current()
+
+    # --- Navigation ---
+
+    def action_cancel_or_back(self) -> None:
+        cmd = self.query_one("#command-input", Input)
+        if cmd.display:
+            self._close_command_input()
+        else:
+            self._df = None
+            self._stack = None
+            self.app.pop_screen()
+
+    def action_cursor_down(self) -> None:
+        self.query_one("#data-view-table", DataTable).action_cursor_down()
+
+    def action_cursor_up(self) -> None:
+        self.query_one("#data-view-table", DataTable).action_cursor_up()
+
+    def action_cursor_left(self) -> None:
+        self.query_one("#data-view-table", DataTable).action_cursor_left()
+
+    def action_cursor_right(self) -> None:
+        self.query_one("#data-view-table", DataTable).action_cursor_right()
+
+    def action_scroll_top(self) -> None:
+        table = self.query_one("#data-view-table", DataTable)
+        table.move_cursor(row=0)
+
+    def action_scroll_bottom(self) -> None:
+        table = self.query_one("#data-view-table", DataTable)
+        if table.row_count > 0:
+            table.move_cursor(row=table.row_count - 1)
+
+    @on(DataTable.CellHighlighted, "#data-view-table")
+    def _on_cell_highlighted(self, event: DataTable.CellHighlighted) -> None:
+        col = event.coordinate.column
+        if self._df is not None and 0 <= col < len(self._df.columns):
+            self._cursor_column_index = col
+            self._update_status_bar()
+
+    # --- Stack browser ---
+
+    def action_toggle_stack_browser(self) -> None:
+        self._stack_browser_visible = not self._stack_browser_visible
+        panel = self.query_one("#stack-browser-panel")
+        panel.display = self._stack_browser_visible
+        if self._stack_browser_visible:
+            self._render_stack_browser()
+
+    def _render_stack_browser(self) -> None:
+        if not self._stack_browser_visible or self._stack is None:
+            return
+        stack = self._stack
+        label = self._row_data.aliases_display or self._row_data.hash[:12]
+        base_marker = "\u2192 " if stack.cursor == 0 else "  "
+        step_lines = tuple(
+            "{}{:<3} {:<9} {}{}".format(
+                "\u2192 " if (i + 1) == stack.cursor else "  ",
+                i + 1,
+                step.verb,
+                step.user_input,
+                "  (undone)" if (i + 1) > stack.cursor else "",
+            )
+            for i, step in enumerate(stack.steps)
+        )
+        code = stack.current_code
+        code_lines = (
+            ("\u2014 code equivalent:", code) if code else ("(no transforms applied)",)
+        )
+        lines = (f"{base_marker}0  base: {label}", *step_lines, "", *code_lines)
+        self.query_one("#stack-browser-content", Static).update("\n".join(lines))
+
+    # --- Persist to catalog ---
+
+    def action_persist(self) -> None:
+        if self._stack is None or self._stack.cursor == 0:
+            return
+        self._command_mode = "save"
+        cmd = self.query_one("#command-input", Input)
+        cmd.value = ""
+        cmd.placeholder = "alias name (leave empty to save without alias)"
+        cmd.border_title = "save\u25b8"
+        cmd.display = True
+        cmd.focus()
+
+    def _do_persist(self, alias=None) -> None:
+        if self._stack is None or self._stack.cursor == 0:
+            return
+        self._persist_to_catalog(alias)
+
+    def _catalog_compose_cmd(self, code: str, alias: str | None) -> list[str]:
+        cmd = self._catalog_base_cmd("compose") + ["-c", code]
+        if alias:
+            cmd.extend(["-a", alias])
+        return cmd
+
+    @work(thread=True, exit_on_error=False)
+    def _persist_to_catalog(self, alias) -> None:
+        code = self._stack.current_code
+        try:
+            cmd = self._catalog_compose_cmd(code, alias)
+            proc = subprocess.run(cmd, capture_output=True)
+            if proc.returncode != 0:
+                raise RuntimeError(proc.stderr.decode(errors="replace").strip())
+            msg = f"Saved as '{alias}'" if alias else "Saved"
+            self.app.call_from_thread(self._show_persist_success, msg)
+        except Exception as e:
+            logger.exception(
+                "catalog_compose_failed",
+                alias=alias,
+                code=code[:500] + "..." if code and len(code) > 500 else code,
+            )
+            self.app.call_from_thread(self._show_command_error, f"Save failed: {e}")
+
+    def _show_persist_success(self, message) -> None:
+        self.query_one("#data-view-status", Static).update(f" \u2713 {message}")
+
+
+class CatalogTUI(App):
+    TITLE = "xorq catalog"
+    CSS = """
+    #main-split { height: 1fr; }
+    #left-column { width: 2fr; }
+    #right-column { width: 3fr; }
+
+    #catalog-panel,
+    #revisions-panel,
+    #git-log-panel,
+    #sql-panel,
+    #lineage-panel,
+    #schema-panel,
+    #data-preview-panel,
+    DataViewScreen #stack-browser-panel {
+        border: solid $panel-dim;
+        border-title-color: $panel-dim-fg;
+        border-subtitle-color: $panel-dim-fg;
+    }
+    #catalog-panel:focus-within,
+    #revisions-panel:focus-within,
+    #git-log-panel:focus-within,
+    #sql-panel:focus-within,
+    #lineage-panel:focus-within,
+    #schema-panel:focus-within,
+    #data-preview-panel:focus-within,
+    DataViewScreen #stack-browser-panel:focus-within {
+        border: double $accent;
+        border-title-color: $accent;
+        border-subtitle-color: $accent;
+    }
+
+    #catalog-panel { height: 2fr; background: $surface; }
+    #catalog-tree { height: 1fr; }
+    #catalog-tree > .tree--guides { color: $panel-dim; }
+    #catalog-tree > .tree--guides-hover { color: $subdued; }
+    #catalog-tree > .tree--guides-selected { color: $accent; }
+    #revisions-panel { height: 1fr; }
+    #revisions-preview-table { height: 1fr; }
+    #git-log-panel { height: 1fr; }
+    #git-log-table { height: 1fr; }
+    #sql-panel { height: 2fr; }
+    #sql-preview { height: auto; padding: 1 2; }
+
+    DataTable:focus { border: none; }
+    Tree:focus { border: none; }
+
+    #lineage-panel { height: 2fr; padding: 0 1; }
+
+    #schema-panel { height: 1fr; }
+    #schema-split { height: 1fr; }
+    #schema-in-half { width: 1fr; }
+    #schema-out-half { width: 1fr; }
+    #schema-in-table { height: 1fr; }
+    #schema-preview-table { height: 1fr; }
+
+    #data-preview-panel { height: 2fr; }
+    #data-preview-status { height: 1; padding: 0 2; }
+    #data-preview-table { height: 1fr; }
+
+    #status-bar {
+        dock: bottom;
+        height: 1;
+        padding: 0 2;
+        background: $surface;
+    }
+
+    DataViewScreen #data-view-status {
+        height: 1;
+        padding: 0 2;
+        background: $surface;
+    }
+    DataViewScreen #data-view-split { height: 1fr; }
+    DataViewScreen #data-view-table { height: 1fr; }
+    DataViewScreen #stack-browser-panel { width: 40; padding: 0 1; }
+    DataViewScreen #stack-browser-content { height: auto; }
+
+    DataViewScreen #command-input {
+        dock: bottom;
+        height: 3;
+        border: solid #2BBE75;
+        border-title-color: #2BBE75;
+        padding: 0 1;
+    }
+
+    AddEntryScreen,
+    AddAliasScreen,
+    DeleteEntryScreen,
+    RemoveAliasScreen {
+        align: center middle;
+        background: $background 65%;
+    }
+    .entry-action-dialog {
+        width: 72;
+        height: auto;
+        padding: 1 2;
+        border: double $accent;
+        background: $surface;
+    }
+    .entry-action-title {
+        height: 1;
+        text-style: bold;
+        color: $accent;
+    }
+    .entry-action-message {
+        height: auto;
+        margin-top: 1;
+        color: $foreground;
+    }
+    #add-entry-path,
+    #add-entry-alias,
+    #add-alias-name,
+    #remove-alias-select { margin-top: 1; }
+    .entry-action-buttons {
+        height: 3;
+        margin-top: 1;
+        align-horizontal: right;
+    }
+    .entry-action-buttons Button { margin-left: 1; }
+    """
+
+    def __init__(self, make_catalog, refresh_interval=DEFAULT_REFRESH_INTERVAL):
+        super().__init__()
+        self._catalog = None
+        self._make_catalog = make_catalog
+        self._refresh_interval = refresh_interval
+        self.register_theme(XORQ_DARK)
+        self.theme = "xorq-dark"
+
+    def on_mount(self) -> None:
+        self.push_screen(CatalogScreen(refresh_interval=self._refresh_interval))
+        self._load_catalog()
+
+    @work(thread=True)
+    def _load_catalog(self) -> None:
+        catalog = self._make_catalog()
+        self.app.call_from_thread(self._set_catalog, catalog)
+
+    def _set_catalog(self, catalog) -> None:
+        self._catalog = catalog
+        self.screen._do_refresh()
