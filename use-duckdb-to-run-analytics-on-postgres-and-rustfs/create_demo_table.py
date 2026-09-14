@@ -44,7 +44,7 @@ REGIONS = ["North", "South", "East", "West"]
 random.seed(42)  # Fixed seed so re-runs produce the same data
 start_date = date(2025, 1, 1)  # Fixed start so the demo data is deterministic
 rows = []
-for row_id in range(1, 101):
+for row_id in range(1, 1001):
     product, category = random.choice(PRODUCTS)
     rows.append(
         (

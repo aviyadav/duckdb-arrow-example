@@ -64,6 +64,9 @@ uv run python create_demo_table.py
 
 # 3. Attach PostgreSQL to DuckDB and query it
 uv run python main.py
+
+# 4. Read with PyArrow ADBC and Polars
+uv run python main_postgres_adbc.py
 ```
 
 ### RustFS S3 Warehouse Workflow
@@ -104,6 +107,7 @@ uv run ruff check .
 | `test_connection.py`    | Verify PostgreSQL connection and print server version            |
 | `create_demo_table.py`  | Create `demo_sales` table in PostgreSQL with 100 rows             |
 | `main.py`               | Attach PostgreSQL to DuckDB and run analytics queries            |
+| `main_postgres_adbc.py` | Read PostgreSQL with PyArrow ADBC and Polars                     |
 | `create_demo_rustfs.py` | Generate 1000 demo rows and write Parquet to `s3://warehouse/`   |
 | `main_rustfs.py`        | Query RustFS S3 Parquet dataset with DuckDB and show analytics   |
 | `main_polars_arrow.py`  | Read and analyze RustFS Parquet data with PyArrow & Polars       |
