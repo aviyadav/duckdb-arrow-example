@@ -1,0 +1,26 @@
+[project]
+name = "moving-large-number-rows-to-ducklake"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "duckdb>=1.5.5",
+    "numpy>=2.5.3",
+    "pandas>=3.0.5",
+    "pathlib>=1.0.1",
+    "psutil>=7.2.2",
+]
+
+[project.scripts]
+moving-large-number-rows-to-ducklake = "moving_large_number_rows_to_ducklake:main"
+init-ducklake = "moving_large_number_rows_to_ducklake.init_ducklake:main"
+partition-events = "moving_large_number_rows_to_ducklake.partition_events:main"
+column-level-storage = "moving_large_number_rows_to_ducklake.column_level_storage:main"
+metadata-query = "moving_large_number_rows_to_ducklake.metadata_query:main"
+run-analysis = "moving_large_number_rows_to_ducklake.run_analysis:run_analysis"
+
+
+[build-system]
+requires = ["uv_build>=0.12.10,<0.13.0"]
+build-backend = "uv_build"

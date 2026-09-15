@@ -1,0 +1,16 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+data/base_flowlogs_partitioned/
+data/main/events/
+data/events.parquet
+src/moving_large_number_rows_to_ducklake/__pycache__/
+uv.lock
+.venv/
