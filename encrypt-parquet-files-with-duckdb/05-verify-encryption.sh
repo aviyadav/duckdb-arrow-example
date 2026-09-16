@@ -1,0 +1,1 @@
+uv run test_unencrypted.py

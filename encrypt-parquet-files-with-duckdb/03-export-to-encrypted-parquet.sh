@@ -1,0 +1,1 @@
+uv run export_encrypted.py

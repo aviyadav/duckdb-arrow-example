@@ -1,0 +1,1 @@
+uv run read_encrypted.py

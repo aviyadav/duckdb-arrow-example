@@ -1,0 +1,1 @@
+uv run generate_key.py

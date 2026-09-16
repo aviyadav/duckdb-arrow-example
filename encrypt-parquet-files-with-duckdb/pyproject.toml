@@ -1,0 +1,11 @@
+[project]
+name = "encrypt-parquet-files-with-duckdb"
+version = "0.1.0"
+requires-python = ">=3.14"
+dependencies = [
+    "duckdb>=1.5.5",
+    "faker>=40.39.0",
+    "fastparquet>=2026.5.0",
+    "keyring>=25.7.0",
+    "pyarrow>=25.0.1",
+]
