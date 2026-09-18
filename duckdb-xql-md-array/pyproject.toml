@@ -1,0 +1,24 @@
+[project]
+name = "duckdb-xql-md-array"
+version = "0.1.0"
+requires-python = ">=3.14"
+dependencies = [
+    "bokeh>=3.9.2",
+    "dask>=2026.8.0",
+    "duckdb>=1.5.5",
+    "duckdb-engine>=0.17.0",
+    "gcsfs>=2026.8.1",
+    "grpcio>=1.84.0",
+    "holoviews>=1.23.2",
+    "hvplot>=0.12.2",
+    "jupysql>=0.11.1",
+    "jupyter>=1.1.1",
+    "jupyter-bokeh>=4.1.0",
+    "matplotlib>=3.11.2",
+    "pandas>=3.0.5",
+    "panel>=1.9.4",
+    "pip>=26.2.1",
+    "xarray>=2026.7.0",
+    "xarray-sql>=0.3.3",
+    "zarr>=3.4.0",
+]
